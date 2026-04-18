@@ -56,6 +56,9 @@ HEARTBEAT_FILE_REMOTE = f"/home/{PI_USER}/.hermes/.ha_heartbeat"
 # WSL is considered offline and Pi will promote itself to primary.
 HEARTBEAT_STALE_SECONDS = int(os.environ.get("HA_HEARTBEAT_STALE", "180"))  # default 3 min
 
+# Watermark file for incremental SQLite merge (tracks max PK per table)
+WATERMARK_FILE = HERMES_HOME / ".ha_watermark.json"
+
 # Data categories with sync strategies
 # NOTE: skills/ is synced via rsync_mirror, but HA scripts (ha_sync.py, ha_watchdog.sh,
 # ha_notify.sh, config_merge.py, gen_shared.py) are EXCLUDED from auto-sync.
@@ -567,13 +570,425 @@ def get_file_mtime(rel_path, remote=False):
 
 
 # ============================================================
-# MERGE: SQLite bidirectional merge
+# WATERMARK: Track max PKs for incremental merge
 # ============================================================
-def merge_sqlite(db_name):
+def load_watermark():
+    """Load watermark state from file."""
+    if WATERMARK_FILE.exists():
+        try:
+            return json.loads(WATERMARK_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_watermark(wm):
+    """Save watermark state to file."""
+    WATERMARK_FILE.write_text(json.dumps(wm, indent=2))
+
+
+def reset_watermarks():
+    """Reset watermarks to current max PKs (after full merge).
+    Both peer_max and local_max are set to the same value since
+    both sides have identical data after a full merge."""
+    watermark = {}
+    for db_name, tables in MERGE_TABLES.items():
+        db_path = HERMES_HOME / db_name
+        if not db_path.exists():
+            continue
+        db_wm = {}
+        try:
+            conn = sqlite3.connect(str(db_path))
+            for table, pk_cols in tables.items():
+                if len(pk_cols) == 1:
+                    pk_col = pk_cols[0]
+                    row = conn.execute(f"SELECT MAX({pk_col}) FROM {table}").fetchone()
+                    max_pk = row[0] if row and row[0] is not None else 0
+                    db_wm[table] = {"peer_max": max_pk, "local_max": max_pk}
+            conn.close()
+        except sqlite3.Error as e:
+            logger.warning("reset_watermarks: %s error: %s", db_name, e)
+        if db_wm:
+            watermark[db_name] = db_wm
+    save_watermark(watermark)
+    logger.debug("Watermarks reset to current max PKs")
+
+
+# ============================================================
+# MERGE: SQLite incremental merge (watermark-based)
+# ============================================================
+def _row_to_json(row):
+    """Convert a SQLite row to JSON-safe list (bytes → base64 string)."""
+    import base64
+    result = []
+    for v in row:
+        if isinstance(v, bytes):
+            result.append({"_bytes_b64": base64.b64encode(v).decode("ascii")})
+        else:
+            result.append(v)
+    return result
+
+
+def _row_from_json(vals):
+    """Convert a JSON-safe list back to original types (base64 → bytes)."""
+    import base64
+    result = []
+    for v in vals:
+        if isinstance(v, dict) and "_bytes_b64" in v:
+            result.append(base64.b64decode(v["_bytes_b64"]))
+        else:
+            result.append(v)
+    return result
+
+
+def merge_sqlite_incremental(db_name):
+    """Incremental merge using watermarks. Single-PK tables use max-PK
+    watermarks to transfer only delta rows. Composite-PK tables fall
+    back to full row exchange (small tables only)."""
+    local_db = HERMES_HOME / db_name
+    tables = MERGE_TABLES.get(db_name, {})
+    if not tables:
+        return False
+
+    print(f"  [merge] {db_name}")
+
+    # Get columns from local DB
+    try:
+        conn = sqlite3.connect(str(local_db))
+    except sqlite3.Error as e:
+        print(f"    Cannot open local DB: {e}")
+        return False
+
+    cols_by_table = {}
+    for table in tables:
+        try:
+            cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            if cols:
+                cols_by_table[table] = cols
+        except sqlite3.Error:
+            pass
+    conn.close()
+
+    if not cols_by_table:
+        print(f"    No tables found")
+        return False
+
+    watermark = load_watermark()
+    db_wm = watermark.setdefault(db_name, {})
+
+    total_new = 0
+
+    for table, pk_cols in tables.items():
+        cols = cols_by_table.get(table)
+        if not cols:
+            continue
+
+        col_list = ", ".join(f'"{c}"' for c in cols)
+        placeholders = ", ".join(["?"] * len(cols))
+
+        if len(pk_cols) == 1:
+            # --- Single PK: incremental via watermark (integer PKs only) ---
+            # String PKs (e.g. UUIDs) cannot use > comparison for watermarks,
+            # so fall back to full row exchange.
+            pk_col = pk_cols[0]
+
+            # Check if PK is integer type by sampling a value
+            pk_is_int = False
+            try:
+                conn = sqlite3.connect(str(local_db))
+                sample = conn.execute(f"SELECT typeof({pk_col}) FROM {table} LIMIT 1").fetchone()
+                conn.close()
+                if sample and sample[0] in ("integer", "INTEGER"):
+                    pk_is_int = True
+            except sqlite3.Error:
+                pass
+
+            if not pk_is_int:
+                # String PK — fall back to full exchange (same as composite PK)
+                remote_full = (
+                    f"import sqlite3, json, base64\n"
+                    f"conn = sqlite3.connect('/home/{PI_USER}/.hermes/{db_name}')\n"
+                    f"rows = conn.execute('SELECT {col_list} FROM {table}').fetchall()\n"
+                    f"for row in rows:\n"
+                    f"    print(json.dumps(_row_to_json(row)))\n"
+                    f"conn.close()"
+                )
+                out, rc = ssh(f"python3 -c {shlex.quote(remote_full)}", timeout=30)
+
+                new_from_peer = 0
+                if rc == 0 and out.strip():
+                    try:
+                        conn = sqlite3.connect(str(local_db))
+                        for line in out.strip().split("\n"):
+                            try:
+                                values = _row_from_json(json.loads(line))
+                                conn.execute(
+                                    f'INSERT OR IGNORE INTO {table} ({col_list}) '
+                                    f'VALUES ({placeholders})', values
+                                )
+                                new_from_peer += 1
+                            except (json.JSONDecodeError, sqlite3.Error):
+                                pass
+                        conn.commit()
+                        conn.close()
+                    except sqlite3.Error:
+                        pass
+
+                # Push all local rows to peer
+                try:
+                    conn = sqlite3.connect(str(local_db))
+                    rows = conn.execute(f'SELECT {col_list} FROM {table}').fetchall()
+                    conn.close()
+                except sqlite3.Error:
+                    rows = []
+
+                new_to_peer = 0
+                if rows:
+                    safe_name = db_name.replace(".", "_")
+                    delta_local = f"/tmp/ha_delta_{safe_name}_{table}.jsonl"
+                    delta_remote = f"/tmp/ha_delta_{safe_name}_{table}.jsonl"
+                    with open(delta_local, "w") as f:
+                        for row in rows:
+                            f.write(json.dumps(_row_to_json(row)) + "\n")
+
+                    _, scp_rc = local(
+                        f"{PI_SCP} {delta_local} {PI_USER}@{PI_HOST}:{delta_remote} 2>/dev/null"
+                    )
+                    if scp_rc == 0:
+                        remote_import = (
+                            f"import sqlite3, json, base64\n"
+                            f"conn = sqlite3.connect('/home/{PI_USER}/.hermes/{db_name}')\n"
+                            f"cols = {json.dumps(cols)}\n"
+                            f"cl = ', '.join(cols)\n"
+                            f"ph = ', '.join(['?'] * len(cols))\n"
+                            f"count = 0\n"
+                            f"with open('{delta_remote}') as f:\n"
+                            f"    for line in f:\n"
+                            f"        vals = json.loads(line)\n"
+                            f"        vals = [base64.b64decode(v['_bytes_b64']) if isinstance(v, dict) and '_bytes_b64' in v else v for v in vals]\n"
+                            f"        conn.execute('INSERT OR IGNORE INTO {table} (' + cl + ') VALUES (' + ph + ')', vals)\n"
+                            f"        count += 1\n"
+                            f"conn.commit()\n"
+                            f"conn.close()\n"
+                            f"print(count)"
+                        )
+                        out2, rc2 = ssh(f"python3 -c {shlex.quote(remote_import)}", timeout=30)
+                        if rc2 == 0:
+                            try:
+                                new_to_peer = int(out2.strip())
+                            except ValueError:
+                                new_to_peer = len(rows)
+
+                    Path(delta_local).unlink(missing_ok=True)
+                    ssh(f"rm -f {delta_remote}")
+
+                total_new += new_from_peer + new_to_peer
+                print(f"    {table}: +{new_from_peer} from peer, +{new_to_peer} to peer (string PK, full exchange)")
+                continue
+
+            # Integer PK — use watermark for incremental
+            table_wm = db_wm.setdefault(table, {"peer_max": 0, "local_max": 0})
+
+            # (a) Pull delta from peer: rows with PK > peer_max
+            peer_since = table_wm["peer_max"]
+            remote_pull = (
+                f"import sqlite3, json, base64\n"
+                f"conn = sqlite3.connect('/home/{PI_USER}/.hermes/{db_name}')\n"
+                f"rows = conn.execute('SELECT {col_list} FROM {table} "
+                f"WHERE {pk_col} > {peer_since} ORDER BY {pk_col}').fetchall()\n"
+                f"for row in rows:\n"
+                f"    print(json.dumps(_row_to_json(row)))\n"
+                f"conn.close()"
+            )
+            out, rc = ssh(f"python3 -c {shlex.quote(remote_pull)}", timeout=30)
+
+            new_from_peer = 0
+            max_peer_pk = peer_since
+            if rc == 0 and out.strip():
+                try:
+                    conn = sqlite3.connect(str(local_db))
+                    pk_idx = cols.index(pk_col)
+                    for line in out.strip().split("\n"):
+                        try:
+                            values = _row_from_json(json.loads(line))
+                            conn.execute(
+                                f'INSERT OR IGNORE INTO {table} ({col_list}) '
+                                f'VALUES ({placeholders})', values
+                            )
+                            new_from_peer += 1
+                            if values[pk_idx] is not None and values[pk_idx] > max_peer_pk:
+                                max_peer_pk = values[pk_idx]
+                        except (json.JSONDecodeError, sqlite3.Error) as e:
+                            logger.debug("Skip peer row: %s", e)
+                    conn.commit()
+                    conn.close()
+                except sqlite3.Error as e:
+                    logger.warning("Pull delta failed for %s.%s: %s", db_name, table, e)
+
+            # (b) Push delta to peer: local rows with PK > local_max
+            local_since = table_wm["local_max"]
+            try:
+                conn = sqlite3.connect(str(local_db))
+                rows = conn.execute(
+                    f'SELECT {col_list} FROM {table} '
+                    f'WHERE {pk_col} > {local_since} ORDER BY {pk_col}'
+                ).fetchall()
+                conn.close()
+            except sqlite3.Error:
+                rows = []
+
+            new_to_peer = 0
+            max_local_pk = local_since
+            if rows:
+                pk_idx = cols.index(pk_col)
+                # Write delta to temp file
+                safe_name = db_name.replace(".", "_")
+                delta_local = f"/tmp/ha_delta_{safe_name}_{table}.jsonl"
+                delta_remote = f"/tmp/ha_delta_{safe_name}_{table}.jsonl"
+                with open(delta_local, "w") as f:
+                    for row in rows:
+                        f.write(json.dumps(_row_to_json(row)) + "\n")
+                        if row[pk_idx] is not None and row[pk_idx] > max_local_pk:
+                            max_local_pk = row[pk_idx]
+
+                # scp to Pi
+                _, scp_rc = local(
+                    f"{PI_SCP} {delta_local} {PI_USER}@{PI_HOST}:{delta_remote} 2>/dev/null"
+                )
+                if scp_rc == 0:
+                    remote_import = (
+                        f"import sqlite3, json, base64\n"
+                        f"conn = sqlite3.connect('/home/{PI_USER}/.hermes/{db_name}')\n"
+                        f"cols = {json.dumps(cols)}\n"
+                        f"cl = ', '.join(cols)\n"
+                        f"ph = ', '.join(['?'] * len(cols))\n"
+                        f"count = 0\n"
+                        f"with open('{delta_remote}') as f:\n"
+                        f"    for line in f:\n"
+f"        vals = json.loads(line)\\n"
+                        f"        vals = [base64.b64decode(v['_bytes_b64']) if isinstance(v, dict) and '_bytes_b64' in v else v for v in vals]\\n"
+                        f"        conn.execute('INSERT OR IGNORE INTO {table} (' + cl + ') VALUES (' + ph + ')', vals)\n"
+                        f"        count += 1\n"
+                        f"conn.commit()\n"
+                        f"conn.close()\n"
+                        f"print(count)"
+                    )
+                    out2, rc2 = ssh(f"python3 -c {shlex.quote(remote_import)}", timeout=30)
+                    if rc2 == 0:
+                        try:
+                            new_to_peer = int(out2.strip())
+                        except ValueError:
+                            new_to_peer = len(rows)
+
+                # Cleanup temp files
+                Path(delta_local).unlink(missing_ok=True)
+                ssh(f"rm -f {delta_remote}")
+
+            # Update watermarks
+            table_wm["peer_max"] = max_peer_pk
+            table_wm["local_max"] = max_local_pk
+            total_new += new_from_peer + new_to_peer
+            print(f"    {table}: +{new_from_peer} from peer, +{new_to_peer} to peer "
+                  f"(watermark: local={max_local_pk}, peer={max_peer_pk})")
+
+        else:
+            # --- Composite PK: full row exchange (small tables) ---
+            remote_full = (
+                f"import sqlite3, json, base64\n"
+                f"conn = sqlite3.connect('/home/{PI_USER}/.hermes/{db_name}')\n"
+                f"rows = conn.execute('SELECT {col_list} FROM {table}').fetchall()\n"
+                f"for row in rows:\n"
+                f"    print(json.dumps(_row_to_json(row)))\n"
+                f"conn.close()"
+            )
+            out, rc = ssh(f"python3 -c {shlex.quote(remote_full)}", timeout=30)
+
+            new_from_peer = 0
+            if rc == 0 and out.strip():
+                try:
+                    conn = sqlite3.connect(str(local_db))
+                    for line in out.strip().split("\n"):
+                        try:
+                            values = _row_from_json(json.loads(line))
+                            conn.execute(
+                                f'INSERT OR IGNORE INTO {table} ({col_list}) '
+                                f'VALUES ({placeholders})', values
+                            )
+                            new_from_peer += 1
+                        except (json.JSONDecodeError, sqlite3.Error):
+                            pass
+                    conn.commit()
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+
+            # Push all local rows to peer
+            try:
+                conn = sqlite3.connect(str(local_db))
+                rows = conn.execute(f'SELECT {col_list} FROM {table}').fetchall()
+                conn.close()
+            except sqlite3.Error:
+                rows = []
+
+            new_to_peer = 0
+            if rows:
+                safe_name = db_name.replace(".", "_")
+                delta_local = f"/tmp/ha_delta_{safe_name}_{table}.jsonl"
+                delta_remote = f"/tmp/ha_delta_{safe_name}_{table}.jsonl"
+                with open(delta_local, "w") as f:
+                    for row in rows:
+                        f.write(json.dumps(_row_to_json(row)) + "\n")
+
+                _, scp_rc = local(
+                    f"{PI_SCP} {delta_local} {PI_USER}@{PI_HOST}:{delta_remote} 2>/dev/null"
+                )
+                if scp_rc == 0:
+                    remote_import = (
+                        f"import sqlite3, json, base64\n"
+                        f"conn = sqlite3.connect('/home/{PI_USER}/.hermes/{db_name}')\n"
+                        f"cols = {json.dumps(cols)}\n"
+                        f"cl = ', '.join(cols)\n"
+                        f"ph = ', '.join(['?'] * len(cols))\n"
+                        f"count = 0\n"
+                        f"with open('{delta_remote}') as f:\n"
+                        f"    for line in f:\n"
+f"        vals = json.loads(line)\\n"
+                        f"        vals = [base64.b64decode(v['_bytes_b64']) if isinstance(v, dict) and '_bytes_b64' in v else v for v in vals]\\n"
+                        f"        conn.execute('INSERT OR IGNORE INTO {table} (' + cl + ') VALUES (' + ph + ')', vals)\n"
+                        f"        count += 1\n"
+                        f"conn.commit()\n"
+                        f"conn.close()\n"
+                        f"print(count)"
+                    )
+                    out2, rc2 = ssh(f"python3 -c {shlex.quote(remote_import)}", timeout=30)
+                    if rc2 == 0:
+                        try:
+                            new_to_peer = int(out2.strip())
+                        except ValueError:
+                            new_to_peer = len(rows)
+
+                Path(delta_local).unlink(missing_ok=True)
+                ssh(f"rm -f {delta_remote}")
+
+            total_new += new_from_peer + new_to_peer
+            print(f"    {table}: +{new_from_peer} from peer, +{new_to_peer} to peer (composite PK, full exchange)")
+
+    save_watermark(watermark)
+    print(f"    [incremental] {total_new} total new rows")
+    return True
+
+
+# ============================================================
+# MERGE: SQLite full merge (legacy, used by takeover/handoff)
+# ============================================================
+def merge_sqlite(db_name, incremental=False):
     """Merge a SQLite database between local and Pi.
-    Strategy: pull Pi's DB, merge rows from both into local, push result back.
-    Push merged DB to Pi FIRST, then replace local (atomic ordering).
-    """
+    incremental=True: use watermarks, only transfer delta rows (for cron push).
+    incremental=False (default): full merge, copies entire DB (for takeover/handoff).
+    After full merge, resets watermarks to current max PKs."""
+    if incremental:
+        return merge_sqlite_incremental(db_name)
+
     local_db = HERMES_HOME / db_name
     pi_db_local_copy = Path(f"/tmp/pi_{db_name}")
     merged_db = Path(f"/tmp/merged_{db_name}")
@@ -673,6 +1088,10 @@ def merge_sqlite(db_name):
     # Cleanup
     pi_db_local_copy.unlink(missing_ok=True)
     merged_db.unlink(missing_ok=True)
+
+    # Reset watermarks to current max PKs (both sides now identical)
+    reset_watermarks()
+
     return True
 
 
@@ -1094,8 +1513,10 @@ def cmd_handoff(args):
 
 
 def cmd_push(args):
-    """Periodic push: backup local data to peer while local is primary.
+    """Periodic push: sync local data to/from peer while local is primary.
     Use case: cron job every 30 min while local is online.
+    SQLite DBs use bidirectional merge (INSERT OR IGNORE) to preserve any
+    rows written on the peer (e.g. Holographic memory hooks on standby).
     """
     state = get_role()
     if state.get("role") != "primary":
@@ -1111,13 +1532,10 @@ def cmd_push(args):
         log_event("error", f"Push skipped: {plbl} unreachable")
         return
 
-    # Only push, don't merge (local is primary, peer shouldn't have new data)
+    # Merge SQLite DBs bidirectionally (incremental via watermarks)
     for db in SYNC_ITEMS["sqlite_merge"]:
-        local_db = HERMES_HOME / db
-        _, rc = local(f"{PI_SCP} {local_db} {PI_USER}@{PI_HOST}:/home/{PI_USER}/.hermes/{db} 2>/dev/null")
-        if rc != 0:
-            log_event("error", f"Push failed: {db} (rc={rc})")
-        print(f"  [push] {db}")
+        if not merge_sqlite(db, incremental=True):
+            log_event("error", f"Merge failed: {db}")
 
     for f in SYNC_ITEMS["text_latest_wins"]:
         local_path = HERMES_HOME / f
