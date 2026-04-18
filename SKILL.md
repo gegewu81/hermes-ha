@@ -1,0 +1,427 @@
+---
+name: agent-ha
+description: Hermes Agent hot-standby HA system. WSL as primary (when online), Pi as always-on backup. Automatic data sync, gateway failover, and brain-split recovery.
+---
+
+# Agent HA — Hot Standby System
+
+## Architecture
+
+```
+  ┌──────────────────┐         ┌──────────────────┐
+  │   WSL (Primary)  │ ──SSH── │   Pi (Standby)   │
+  │   When Online    │  ────→  │   Always Online   │
+  │   x86_64, fast   │  ←──── │   arm64, slower   │
+  └──────────────────┘  can't  └──────────────────┘
+         │              reach       │
+         │              WSL         │
+    ┌────┴────┐                   ┌─┴──┐
+    │ Gateway │                   │ GW │  (only one active)
+    │ ACTIVE  │                   │ OFF │
+    └─────────┘                   └────┘
+```
+
+**Rules:**
+1. WSL is primary when online (stronger performance)
+2. Pi takes over when WSL goes offline (always-on)
+3. Only one gateway active at a time (prevent channel conflicts)
+4. All sync initiated by WSL → Pi (Pi cannot reach WSL behind NAT)
+5. Data flows bidirectionally via merge, never overwrite-and-lose
+
+## State Machine
+
+```
+                WSL boots up
+                     │
+                     ▼
+              ┌──────────────┐
+              │   takeover   │ ── pull Pi data, merge, become primary
+              └──────┬───────┘
+                     │
+                     ▼
+         ┌───────────────────────┐
+         │  WSL=Primary running  │ ←── periodic push every 30min
+         │  Pi=Standby (GW off)  │
+         └───────────┬───────────┘
+                     │ WSL goes offline
+                     ▼
+              ┌──────────────┐
+              │   handoff    │ ── push data, stop local GW, start Pi GW
+              └──────┬───────┘
+                     │
+                     ▼
+         ┌───────────────────────┐
+         │  Pi=Primary running   │
+         │  WSL=Offline          │
+         └───────────┴───────────┘
+                     │ WSL comes back
+                     └──── loop back to takeover
+```
+
+## All Scenarios Covered
+
+| # | Scenario | What happens |
+|---|----------|-------------|
+| A | WSL online, Pi online | WSL=primary, Pi=standby. Cron pushes data every 30min, heartbeat every 2min |
+| B | WSL online, Pi offline | WSL=primary standalone. Push/heartbeat fails silently, retry next cycle |
+| C | WSL offline, Pi online | Pi detects heartbeat timeout (3min), auto-promotes to primary, starts gateway |
+| D | WSL offline, Pi offline | No service. Data preserved locally |
+| E | Both online, both have gateway | Pi watchdog detects WSL heartbeat → stops Pi GW (safety net) |
+| F | WSL crashes (no handoff) | Pi detects heartbeat timeout → auto-promotes, starts GW (3min max delay) |
+| G | Pi crashes while standby | WSL continues. Pi syncs when recovered |
+| H | Network split (both think primary) | takeover merges both sides' data. Last-write-wins for text, row-merge for SQLite |
+
+## Data Sync Strategy
+
+### By data type
+
+| Category | Data | Strategy | Why |
+|----------|------|----------|-----|
+| **SQLite** | state.db, memory_store.db | Row-level merge | Both sides may accumulate new data during split |
+| **Text** | MEMORY.md, USER.md, SOUL.md | Latest mtime wins | Single-file, last-write semantics |
+| **Dirs** | skills/, sessions/ | rsync bidirectional (add-only) | Append-only, no conflicts |
+| **Channels** | weixin/, pairing/, channel_directory.json | Primary-only push | Only active GW writes these |
+| **Shared Config** | config.shared.yaml | Primary push + config_merge | Keeps behavioral config identical on both sides |
+
+### Config sync (shared vs environment-specific)
+
+`config.shared.yaml` contains core behavioral sections that define "who the agent is":
+- memory, plugins, skills, cron, agent, browser, model, tts, stt, voice, etc.
+- Synced from WSL (primary) to Pi during push/takeover/handoff
+- Applied via `config_merge.py` which overlays shared sections onto config.yaml
+
+`config.yaml` retains environment-specific sections on each side:
+- `command_allowlist` — security policy (may differ per environment)
+- `security` — tirith_enabled etc. (environment security level)
+- `mcp_servers` — may have different connect_timeout per environment
+- `_config_version`, `dashboard`, `bedrock` — internal/version-specific
+
+**Workflow for config changes:**
+1. Edit config on WSL (primary)
+2. If you changed a core section (memory, skills, etc.): regenerate shared → `python3 ~/.hermes/skills/devops/agent-ha/scripts/config_merge.py --check` → push
+3. Cron push (every 30min) auto-syncs shared config to Pi
+
+### SQLite merge logic
+
+```
+Pi DB + Local DB → Merged DB
+  - For each table, INSERT rows from Pi that don't exist in local (by PK)
+  - Result replaces both sides
+  - No data loss: only ADD, never DELETE
+```
+
+## Commands
+
+### ha_sync.py v2 — Core sync script (Node-Aware)
+
+Located at `~/.hermes/skills/devops/agent-ha/scripts/ha_sync.py`
+
+**v2 changes (2026-04-18):**
+- Auto node detection (WSL vs Pi) via `/proc/device-tree/model`, `/proc/version`, `uname -m`
+- `~/.hermes/.ha_node` — node metadata (name, type, platform, arch, model, ips, hermes_version)
+- `~/.hermes/.ha_peer` — cached peer info (discovered via SSH)
+- `~/.hermes/.ha_events.jsonl` — event log (failover, takeover, handoff, etc.)
+- Epoch counter in state (prevents split-brain)
+- All output includes node identity labels (e.g., `[wsl|x86_64]`, `[pi|RPi 4 Model B Rev 1.4|aarch64]`)
+- User notification on role changes (`hermes chat -q`)
+- New commands: `init-node`, `events` (-n count, -t type filter)
+
+Environment variables (optional, override defaults):
+```bash
+export HA_PI_HOST=PI_IP_PLACEHOLDER    # Pi IP
+export HA_PI_USER=ha_user           # Pi username
+export HA_HEARTBEAT_STALE=180      # Heartbeat stale threshold (seconds)
+```
+
+File locking: uses `~/.hermes/.ha_lock` (fcntl LOCK_EX|LOCK_NB). Concurrent runs are rejected.
+
+```bash
+# Initialize/update node identity (run once on each node)
+python3 ha_sync.py init-node
+
+# View current state (includes node identity, epoch, peer status)
+python3 ha_sync.py status
+
+# WSL comes online → become primary
+python3 ha_sync.py takeover
+
+# WSL going offline → hand off to Pi
+python3 ha_sync.py handoff
+
+# Periodic backup (cron, every 30min)
+python3 ha_sync.py push
+
+# Lightweight heartbeat (cron, every 2min) — signals local node is alive to peer
+python3 ha_sync.py heartbeat
+
+# Check and fix version mismatch between sides
+python3 ha_sync.py sync-version
+
+# Manual merge of specific DB
+python3 ha_sync.py merge-db state.db
+
+# Show recent HA events
+python3 ha_sync.py events
+python3 ha_sync.py events -n 50 -t failover
+```
+
+### SSH Key Auth (required)
+
+ha_sync.py uses passwordless SSH. Setup once:
+```bash
+ssh-keygen -t ed25519 -C 'hermes-ha@wsl' -f ~/.ssh/id_ed25519 -N ''
+ssh-copy-id ha_user@PI_IP_PLACEHOLDER
+# Verify:
+ssh -o BatchMode=yes ha_user@PI_IP_PLACEHOLDER 'echo OK'
+```
+
+## Setup
+
+### 1. SSH Key Auth (do this first)
+
+```bash
+ssh-keygen -t ed25519 -C 'hermes-ha@wsl' -f ~/.ssh/id_ed25519 -N ''
+ssh-copy-id ha_user@PI_IP_PLACEHOLDER
+# Verify: ssh -o BatchMode=yes ha_user@PI_IP_PLACEHOLDER 'echo OK'
+```
+
+Also add to `~/.ssh/config`:
+```
+Host pi
+    HostName PI_IP_PLACEHOLDER
+    User ha_user
+    IdentityFile ~/.ssh/id_ed25519
+    ServerAliveInterval 30
+    ConnectTimeout 5
+```
+
+### 2. Deploy sync script to WSL
+
+```bash
+# Script is at ~/.hermes/skills/devops/agent-ha/scripts/ha_sync.py
+# Uses SSH key auth (no password stored)
+chmod +x ~/.hermes/skills/devops/agent-ha/scripts/ha_sync.py
+```
+
+### 3. WSL cron — periodic push + heartbeat
+
+```bash
+mkdir -p ~/.hermes/logs
+(crontab -l 2>/dev/null; echo "*/30 * * * * /usr/bin/python3 ~/.hermes/skills/devops/agent-ha/scripts/ha_sync.py push >> ~/.hermes/logs/ha_push.log 2>&1") | crontab -
+# Heartbeat every 2 minutes — lightweight SSH, signals WSL is alive to Pi watchdog
+(crontab -l 2>/dev/null; echo "*/2 * * * * /usr/bin/python3 ~/.hermes/skills/devops/agent-ha/scripts/ha_sync.py heartbeat >> ~/.hermes/logs/ha_heartbeat.log 2>&1") | crontab -
+```
+
+### 4. Pi gateway systemd service
+
+Deploy from WSL:
+```bash
+# Create service file locally first
+cat > /tmp/hermes-gateway.service << 'EOF'
+[Unit]
+Description=Hermes Agent Gateway
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=PATH=~/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=~/
+ExecStart=~/.local/bin/hermes gateway run --replace
+Restart=on-failure
+RestartSec=10
+WorkingDirectory=~/
+
+[Install]
+WantedBy=default.target
+EOF
+
+# Deploy and activate
+scp /tmp/hermes-gateway.service ha_user@PI_IP_PLACEHOLDER:~/.config/systemd/user/
+ssh ha_user@PI_IP_PLACEHOLDER 'systemctl --user daemon-reload && systemctl --user enable hermes-gateway.service && loginctl enable-linger ha_user'
+```
+**IMPORTANT:** Keep Environment= PATH short! Long PATH with node/bin caused 216/GROUP error.
+**IMPORTANT:** Must `systemctl --user enable` (not just daemon-reload). Without enable, Restart=on-failure won't work.
+
+### 5. Pi watchdog + cron
+
+Deploy watchdog from WSL (avoids heredoc quoting issues):
+```bash
+# Create watchdog locally, then scp to Pi
+# Watchdog checks .ha_state every minute:
+#   Pi is primary → start gateway via systemd
+#   Pi is standby → stop gateway (safety net)
+scp ~/.hermes/skills/devops/agent-ha/scripts/ha_watchdog.sh ha_user@PI_IP_PLACEHOLDER:~/ha_watchdog.sh
+ssh ha_user@PI_IP_PLACEHOLDER 'chmod +x ~/ha_watchdog.sh && (echo "* * * * * ~/ha_watchdog.sh" | crontab -)'
+```
+
+### 6. WSL systemd auto-takeover
+
+```ini
+# ~/.config/systemd/user/hermes-ha-takeover.service
+[Unit]
+Description=Hermes HA Auto-Takeover
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 ~/.hermes/skills/devops/agent-ha/scripts/ha_sync.py takeover
+RemainAfterExit=yes
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable hermes-ha-takeover.service
+```
+
+## Version Sync Strategy
+
+Keep both sides on the same hermes version to avoid config.yaml structural drift.
+
+### Checking versions
+
+`status` command shows version comparison:
+```
+Version: WSL=0.10.0  Pi=0.10.0  [OK]
+```
+
+### Fixing version mismatch
+
+```bash
+python3 ha_sync.py sync-version
+# Auto-detects which side is older, runs hermes update + config migrate on it
+```
+
+### After hermes update on WSL
+
+1. Stop gateway first: `systemctl --user stop hermes-gateway.service`
+2. Run `hermes update`
+3. Handle stash conflicts if any: `cd ~/.hermes/hermes-agent && git stash pop` (may need `--reject` then manual fix)
+4. Run `hermes config migrate`
+5. Restart gateway: `systemctl --user start hermes-gateway.service`
+6. Run `sync-version` to update Pi too
+7. Run `push` to sync data
+
+### Config.yaml sync policy
+
+Uses `config.shared.yaml` + `config_merge.py` for automatic config sync:
+
+- **Shared sections** (memory, plugins, skills, cron, model, tts, etc.) — defined in `config.shared.yaml`, auto-synced during push/takeover/handoff
+- **Environment-specific sections** (command_allowlist, security, mcp_servers) — intentionally different per side, never overwritten
+- **Internal sections** (_config_version, dashboard, bedrock) — managed by hermes itself
+
+**To add a new shared section:** edit it in WSL's config.yaml, then regenerate shared:
+```bash
+python3 ~/.hermes/skills/devops/agent-ha/scripts/gen_shared.py  # regenerates config.shared.yaml
+python3 ~/.hermes/skills/devops/agent-ha/scripts/config_merge.py --check  # verify
+python3 ~/.hermes/skills/devops/agent-ha/scripts/ha_sync.py push  # sync to Pi
+```
+
+**To check config drift:**
+```bash
+python3 ~/.hermes/skills/devops/agent-ha/scripts/config_merge.py --check
+```
+
+### config_merge.py — Config overlay merge
+
+Located at `~/.hermes/skills/devops/agent-ha/scripts/config_merge.py`
+
+Overlays `config.shared.yaml` sections onto `config.yaml`, preserving environment-specific sections.
+
+```bash
+# Check what would change (dry)
+python3 config_merge.py --check
+
+# Apply merge
+python3 config_merge.py
+
+# Dry run (print changes without writing)
+python3 config_merge.py --dry-run
+```
+
+Sections from shared: memory, plugins, skills, cron, agent, browser, model, tts, stt, voice, terminal, display, delegation, etc.
+Sections preserved: command_allowlist, security, mcp_servers, _config_version, dashboard, bedrock.
+
+## Brain-Split Recovery
+
+If both sides ran independently and accumulated data:
+
+1. WSL comes online, runs `takeover`
+2. Script pulls Pi's databases, merges row-by-row
+3. New sessions from Pi are added to WSL's state.db
+4. New facts from Pi are added to WSL's memory_store.db
+5. Text files: latest mtime wins
+6. Skills/sessions: additive merge (never deletes)
+7. Result is pushed back to Pi
+
+**Data loss risk:** Minimal. Only scenario is if both sides independently modified the *same text file* (MEMORY.md) — last mtime wins. SQLite is fully merge-safe.
+
+## Deployment Status
+
+- [x] ha_sync.py written and deployed to WSL
+- [x] `status` command tested — works
+- [x] `push` command tested — works (syncs SQLite + channel state to Pi)
+- [x] `heartbeat` command — lightweight heartbeat (WSL alive signal to Pi)
+- [x] `takeover` command tested — works (merges Pi data, stops Pi GW, starts WSL GW)
+- [x] `handoff` command tested — works (pushes data, stops WSL GW, starts Pi GW via systemd)
+- [x] Pi watchdog (`ha_watchdog.sh`) — deployed to Pi, cron every minute, **heartbeat-based failover**
+- [x] WSL cron (periodic push) — set up, every 30 minutes
+- [x] WSL cron (heartbeat) — set up, every 2 minutes
+- [x] WSL systemd auto-takeover service — enabled (hermes-ha-takeover.service)
+- [x] SSH key auth — set up (ed25519, passwordless)
+- [x] Pi gateway systemd service — deployed and **enabled** (hermes-gateway.service)
+- [x] Pi loginctl enable-linger — enabled (user services survive logout/reboot)
+- [x] End-to-end test: handoff → verify Pi primary → takeover → verify WSL primary
+- [x] End-to-end test: heartbeat failover → verify Pi auto-promotes on WSL offline
+
+## Pitfalls & Lessons
+
+1. **Pi cannot reach WSL** — WSL is behind NAT (172.21.x.x). All sync must be WSL-initiated. Pi's `ha_watchdog.sh` can only check local state, cannot pull data from WSL.
+2. **Pi gateway systemd user service** — needs `loginctl enable-linger` for user services to survive logout/reboot. Error code 216/GROUP means bad Environment= line in service file.
+3. **Pi venv has no pip** — installed via `uv`, not standard pip. Don't try `pip install -e .` on Pi. The hermes binary works fine as-is.
+4. **state.db schema v6** is compatible between v0.9.0 (WSL) and v0.10.0 (Pi) — confirmed.
+5. **`hermes gateway run --replace`** is the correct command to start gateway on both sides. `hermes gateway start` only works with systemd service.
+6. **WSL systemd service for gateway** already exists (`hermes-gateway.service`), auto-starts on login. HA takeover should restart it, not create a new one.
+7. **SCP mtime issue** — scp overwrites file timestamps, making the destination appear "newer" in status check. Use `rsync -a` (preserves timestamps) for the merged DB push-back to avoid this.
+8. **systemctl vs nohup** — systemd user service needs simple PATH. Long PATH with node/bin etc. caused 216/GROUP error. Keep Environment= lines short.
+9. **hermes update with local changes — full recovery procedure:**
+   ```bash
+   systemctl --user stop hermes-gateway.service          # 1. Stop gateway first
+   hermes update                                         # 2. Update (auto-stashes local changes)
+   cd ~/.hermes/hermes-agent
+   git stash show                                        # 3. Check what was stashed
+   git stash pop                                         # 4. Pop stash (may conflict)
+   # If conflicts: use --reject fallback
+   git stash show -p | git apply --reject --whitespace=nowarn
+   # Fix .rej files manually (grep for context in new version, re-patch)
+   rm -f **/*.rej
+   hermes config migrate                                 # 5. Migrate config to new version
+   systemctl --user start hermes-gateway.service         # 6. Restart gateway
+   # 7. Sync to Pi
+   python3 ~/.hermes/skills/devops/agent-ha/scripts/ha_sync.py push
+   python3 ~/.hermes/skills/devops/agent-ha/scripts/ha_sync.py sync-version
+   ```
+   Key files that get local patches: `error_classifier.py` (Chinese rate-limit patterns), `run_agent.py` (holographic on_pre_compress), `holographic/__init__.py` (auto_extract), `holographic/plugin.yaml` (on_pre_compress hook).
+10. **Deploy scripts via scp, not SSH heredoc** — nested quoting in `ssh 'cat > file << EOF'` is fragile. Create files locally, then `scp` to Pi.
+11. **hermes update may change file offsets** — local patches (e.g. error_classifier.py Chinese rate-limit patterns) may fail if upstream moved code. Check `.rej` files, find correct line by `grep -n` for context, re-apply patch manually.
+12. **Pi systemd HEREDOC variable expansion** — `<< SERVICE_EOF` (unquoted) expands $HOME at deploy time. Use this for parameterization. `<< 'SERVICE_EOF'` (quoted) preserves $HOME literally — wrong for systemd templates.
+13. **rsync --update for bidirectional sync** — plain `rsync -a` overwrites newer files on the receiving side. Adding `--update` (`rsync -a --update`) skips files that are newer on receiver, preventing accidental data overwrite during split-brain recovery.
+14. **config change workflow** — after editing config on WSL, if core sections changed (memory/skills/approvals etc.), must regenerate shared + push to Pi, otherwise Pi keeps old values. Run `gen_shared.py` → `push`.
+15. **CRITICAL: Pi gateway service must be `enabled`** — `systemctl --user enable hermes-gateway.service` is required for `Restart=on-failure` to work. Initial deployment only did `daemon-reload` but forgot `enable`. Without enable, the service is "disabled" — first failure is permanent, watchdog's `systemctl start` runs but the service won't auto-restart after crashes. Fix: `ssh pi 'systemctl --user enable hermes-gateway.service'`.
+16. **WSL shutdown → Pi auto-failover via heartbeat** — WSL writes heartbeat timestamp to Pi every 2min. Pi watchdog (every 1min) checks heartbeat age. If stale > 180s, Pi auto-promotes to primary and starts gateway. Max failover delay: ~3 minutes. No need for explicit handoff before WSL shutdown. Takeover clears stale heartbeat to prevent false failover.
+17. **Pi gateway first-start may fail with exit 1** — Observed at 09:12 CST 2026-04-18: Pi gateway started by watchdog but exited after 1s with code=exited, status=1. No clear error in journal (just "Hermes Gateway Starting..." then immediate exit). Possible causes: race condition with WSL takeover (WSL may have been shutting down Pi gateway simultaneously), or platform connection failure. Subsequent manual start worked fine. The `Restart=on-failure` + `enable` fix (pitfall #15) should handle this going forward.
+18. **Config values in shared sections must be edited in config.shared.yaml too** — If you change a shared-section value (e.g. `persistent_retry_interval`) directly in `config.yaml`, the next `push` will overwrite it back from `config.shared.yaml`. Always edit both `config.yaml` AND `config.shared.yaml`, then push. Or edit only `config.shared.yaml`, then run `config_merge.py` to apply locally, then push.
+
+## Security Notes
+
+- SSH key auth (ed25519) — no passwords stored anywhere
+- Key: `~/.ssh/id_ed25519`, deployed to Pi's `authorized_keys`
+- Channel credentials are synced between sides — same bot token, same auth
+- PI_HOST/PI_USER read from env vars `HA_PI_HOST`/`HA_PI_USER` (defaults in code for convenience)
+- File locking via fcntl prevents concurrent ha_sync instances from corrupting data
+- All shell commands use shlex.quote() to prevent injection
+- SQLite merge pushes to Pi FIRST, then replaces local (atomic ordering)
+- Published to GitHub: https://github.com/gegewu81/hermes-ha
