@@ -39,11 +39,8 @@ logger = logging.getLogger("ha_sync")
 # ============================================================
 # CONFIG — adjust these for your environment
 # ============================================================
-PI_HOST = os.environ.get("HA_PI_HOST", "")
-PI_USER = os.environ.get("HA_PI_USER", "")
-if not PI_HOST or not PI_USER:
-    print("Error: HA_PI_HOST and HA_PI_USER must be set (via env vars or .env)")
-    sys.exit(1)
+PI_HOST = os.environ["HA_PI_HOST"]  # Required: set in ~/.hermes/.env
+PI_USER = os.environ["HA_PI_USER"]  # Required: set in ~/.hermes/.env
 PI_SSH = f"ssh -o BatchMode=yes -o ConnectTimeout=8 {PI_USER}@{PI_HOST}"
 PI_SCP = f"scp -o BatchMode=yes -o ConnectTimeout=8"
 
@@ -61,6 +58,38 @@ HEARTBEAT_STALE_SECONDS = int(os.environ.get("HA_HEARTBEAT_STALE", "180"))  # de
 
 # Watermark file for incremental SQLite merge (tracks max PK per table)
 WATERMARK_FILE = HERMES_HOME / ".ha_watermark.json"
+
+# Counter for temp script filenames to avoid collisions
+_script_counter = 0
+
+
+def ssh_run_script(script_code, timeout=30):
+    """Run a Python script on the remote Pi via scp+exec instead of
+    shlex.quote.  Fixes the bug where multi-line Python code containing
+    single quotes breaks inside ``shlex.quote`` (single-quote wrapping
+    cannot span newlines in bash).
+
+    Writes the script to a temp file, scp's it to Pi, executes, cleans up.
+    Returns (stdout, returncode).
+    """
+    global _script_counter
+    _script_counter += 1
+    local_tmp = f"/tmp/ha_remote_{_script_counter}.py"
+    remote_tmp = f"/tmp/ha_remote_{_script_counter}.py"
+
+    Path(local_tmp).write_text(script_code)
+    scp_rc = local(f"{PI_SCP} {local_tmp} {PI_USER}@{PI_HOST}:{remote_tmp} 2>/dev/null")[1]
+    if scp_rc != 0:
+        Path(local_tmp).unlink(missing_ok=True)
+        return "", 1
+
+    out, rc = ssh(f"python3 {remote_tmp}", timeout=timeout)
+
+    # Cleanup
+    Path(local_tmp).unlink(missing_ok=True)
+    ssh(f"rm -f {remote_tmp}")
+
+    return out, rc
 
 # Data categories with sync strategies
 # NOTE: skills/ is synced via rsync_mirror, but HA scripts (ha_sync.py, ha_watchdog.sh,
@@ -716,7 +745,7 @@ def merge_sqlite_incremental(db_name):
                     f"    print(json.dumps(_row_to_json(row)))\n"
                     f"conn.close()"
                 )
-                out, rc = ssh(f"python3 -c {shlex.quote(remote_full)}", timeout=30)
+                out, rc = ssh_run_script(remote_full, timeout=30)
 
                 new_from_peer = 0
                 if rc == 0 and out.strip():
@@ -775,7 +804,7 @@ def merge_sqlite_incremental(db_name):
                             f"conn.close()\n"
                             f"print(count)"
                         )
-                        out2, rc2 = ssh(f"python3 -c {shlex.quote(remote_import)}", timeout=30)
+                        out2, rc2 = ssh_run_script(remote_import, timeout=30)
                         if rc2 == 0:
                             try:
                                 new_to_peer = int(out2.strip())
@@ -803,7 +832,7 @@ def merge_sqlite_incremental(db_name):
                 f"    print(json.dumps(_row_to_json(row)))\n"
                 f"conn.close()"
             )
-            out, rc = ssh(f"python3 -c {shlex.quote(remote_pull)}", timeout=30)
+            out, rc = ssh_run_script(remote_pull, timeout=30)
 
             new_from_peer = 0
             max_peer_pk = peer_since
@@ -876,7 +905,7 @@ f"        vals = json.loads(line)\\n"
                         f"conn.close()\n"
                         f"print(count)"
                     )
-                    out2, rc2 = ssh(f"python3 -c {shlex.quote(remote_import)}", timeout=30)
+                    out2, rc2 = ssh_run_script(remote_import, timeout=30)
                     if rc2 == 0:
                         try:
                             new_to_peer = int(out2.strip())
@@ -904,7 +933,7 @@ f"        vals = json.loads(line)\\n"
                 f"    print(json.dumps(_row_to_json(row)))\n"
                 f"conn.close()"
             )
-            out, rc = ssh(f"python3 -c {shlex.quote(remote_full)}", timeout=30)
+            out, rc = ssh_run_script(remote_full, timeout=30)
 
             new_from_peer = 0
             if rc == 0 and out.strip():
@@ -963,7 +992,7 @@ f"        vals = json.loads(line)\\n"
                         f"conn.close()\n"
                         f"print(count)"
                     )
-                    out2, rc2 = ssh(f"python3 -c {shlex.quote(remote_import)}", timeout=30)
+                    out2, rc2 = ssh_run_script(remote_import, timeout=30)
                     if rc2 == 0:
                         try:
                             new_to_peer = int(out2.strip())
@@ -1442,8 +1471,10 @@ def cmd_takeover(args):
     print("\nEnsuring local gateway is running...")
     start_local_gateway()
 
-    # Clear stale heartbeat on peer (we are back online, will write fresh ones)
-    ssh(f"rm -f {HEARTBEAT_FILE_REMOTE}")
+    # Write a FRESH heartbeat instead of clearing it.
+    # Clearing creates a 0-120s window where watchdog sees age=9999 (file missing)
+    # and false-promotes Pi back to primary before WSL cron heartbeat kicks in.
+    write_heartbeat()
 
     # 4. Record state with winning epoch
     node_name = node.get("name", "wsl")
