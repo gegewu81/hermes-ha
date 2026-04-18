@@ -57,6 +57,18 @@ HEARTBEAT_FILE_REMOTE = f"/home/{PI_USER}/.hermes/.ha_heartbeat"
 HEARTBEAT_STALE_SECONDS = int(os.environ.get("HA_HEARTBEAT_STALE", "180"))  # default 3 min
 
 # Data categories with sync strategies
+# NOTE: skills/ is synced via rsync_mirror, but HA scripts (ha_sync.py, ha_watchdog.sh,
+# ha_notify.sh, config_merge.py, gen_shared.py) are EXCLUDED from auto-sync.
+# These files should only be updated via explicit deployment (scp/git), never by cron push.
+# This prevents a stale primary from overwriting newer code on the standby.
+SYNC_EXCLUDE = [
+    "skills/devops/agent-ha/scripts/ha_sync.py",
+    "skills/devops/agent-ha/scripts/ha_watchdog.sh",
+    "skills/devops/agent-ha/scripts/ha_notify.sh",
+    "skills/devops/agent-ha/scripts/config_merge.py",
+    "skills/devops/agent-ha/scripts/gen_shared.py",
+]
+
 SYNC_ITEMS = {
     "sqlite_merge": [
         "memory_store.db",  # facts, entities — merge by row
@@ -412,6 +424,73 @@ def get_epoch():
     return state.get("epoch", 0)
 
 
+def read_peer_epoch():
+    """Read peer's current epoch and role from its state file via SSH.
+    Returns dict with 'epoch', 'role', 'node', or None if unreachable.
+    """
+    if not pi_reachable():
+        return None
+    out, _ = ssh("cat ~/.hermes/.ha_state 2>/dev/null || echo '{}'")
+    try:
+        peer_state = json.loads(out)
+        return {
+            "epoch": peer_state.get("epoch", 0),
+            "role": peer_state.get("role", "unknown"),
+            "node": peer_state.get("node", "unknown"),
+        }
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def resolve_epoch(peer_epoch=None):
+    """Calculate the winning epoch for a role change.
+    Returns max(local_epoch, peer_epoch) + 1.
+    If peer_epoch is None (unreachable), just increment local.
+    This ensures the new primary always has a strictly higher epoch
+    than any previous primary, preventing split-brain.
+    """
+    local = get_epoch()
+    if peer_epoch is not None and peer_epoch > local:
+        return peer_epoch + 1
+    return local + 1
+
+
+def check_split_brain():
+    """Check if peer also thinks it's primary (potential split-brain).
+    Returns: (is_conflict, peer_state_dict_or_None, description_string)
+    """
+    peer = read_peer_epoch()
+    if peer is None:
+        return False, None, "peer unreachable"
+
+    local_state = get_role()
+    local_epoch = local_state.get("epoch", 0)
+    local_role = local_state.get("role", "unknown")
+
+    if peer["role"] == "primary" and local_role == "primary":
+        # Both primary — true split-brain
+        if peer["epoch"] >= local_epoch:
+            return True, peer, (
+                f"SPLIT-BRAIN: both sides claim PRIMARY. "
+                f"local epoch={local_epoch}, peer ({peer['node']}) epoch={peer['epoch']}. "
+                f"Proceeding — our takeover will set epoch={peer['epoch'] + 1} to win."
+            )
+        else:
+            # We have higher epoch — we already won previously
+            return False, peer, (
+                f"Peer ({peer['node']}) claims PRIMARY but epoch {peer['epoch']} < our {local_epoch}. "
+                f"We already won the race. Proceeding to confirm."
+            )
+    elif peer["role"] == "primary":
+        # Peer is primary, we are not — normal takeover scenario
+        return False, peer, (
+            f"Peer ({peer['node']}) is PRIMARY (epoch {peer['epoch']}). "
+            f"Normal takeover — will supersede with epoch={peer['epoch'] + 1}."
+        )
+
+    return False, peer, f"Peer ({peer['node']}) role={peer['role']} epoch={peer['epoch']}"
+
+
 # ============================================================
 # HA STATE MANAGEMENT
 # ============================================================
@@ -425,12 +504,18 @@ def get_role():
     return {"role": "unknown", "last_sync": 0, "last_primary": "unknown", "node": "unknown", "node_type": "unknown", "epoch": 0}
 
 
-def set_role(role, primary="unknown"):
-    """Write current HA role to state file. Includes node identity and epoch."""
+def set_role(role, primary="unknown", epoch=None):
+    """Write current HA role to state file. Includes node identity and epoch.
+    epoch: if provided, use this value; otherwise auto-increment on primary/offline.
+    """
     node = get_node()
     state = get_role()
-    # Increment epoch on role changes
-    new_epoch = state.get("epoch", 0) + 1 if role in ("primary", "offline") else state.get("epoch", 0)
+    if epoch is not None:
+        new_epoch = epoch
+    elif role in ("primary", "offline"):
+        new_epoch = state.get("epoch", 0) + 1
+    else:
+        new_epoch = state.get("epoch", 0)
     state = {
         "role": role,
         "last_sync": time.time(),
@@ -451,7 +536,8 @@ def set_role(role, primary="unknown"):
     Path(tmp).write_text(state_pi)
     _, rc = local(f"{PI_SCP} {tmp} {PI_USER}@{PI_HOST}:/home/{PI_USER}/.hermes/.ha_state 2>/dev/null")
     if rc != 0:
-        print(f"  [warn] Failed to push HA state to Pi (rc={rc})")
+        print(f"  [warn] Failed to push HA state to peer (rc={rc})")
+    return new_epoch
 
 
 def get_db_mtime(db_name, remote=False):
@@ -619,14 +705,26 @@ def sync_text_latest_wins(rel_path):
 # SYNC: Directory mirror (rsync)
 # ============================================================
 def sync_rsync_mirror(rel_path):
-    """Two-way rsync: push new files from local, pull new files from Pi."""
+    """Two-way rsync: push new files from local, pull new files from Pi.
+    Uses --update to skip files that are newer on the receiving side.
+    Excludes HA scripts (SYNC_EXCLUDE) to prevent overwriting newer code.
+    """
     dest = f"{PI_USER}@{PI_HOST}:/home/{PI_USER}/.hermes/{rel_path}"
     src = str(HERMES_HOME / rel_path)
 
-    # Push local -> Pi (add new, don't delete)
-    local(f"rsync -az --timeout=10 {src}/ {dest}/ 2>/dev/null")
-    # Pull Pi -> local (add new, don't delete)
-    local(f"rsync -az --timeout=10 {dest}/ {src}/ 2>/dev/null")
+    # Build exclude args for HA scripts (only relevant for skills/ dir)
+    exclude_args = ""
+    for exc in SYNC_EXCLUDE:
+        if exc.startswith(rel_path):
+            # Relative to the rsync root
+            rel_exc = exc[len(rel_path):]
+            if rel_exc:
+                exclude_args += f" --exclude='{rel_exc.lstrip('/')}'"
+
+    # Push local -> Pi (add new, skip files newer on Pi)
+    local(f"rsync -az --update --timeout=10{exclude_args} {src}/ {dest}/ 2>/dev/null")
+    # Pull Pi -> local (add new, skip files newer locally)
+    local(f"rsync -az --update --timeout=10{exclude_args} {dest}/ {src}/ 2>/dev/null")
     print(f"  [sync] {rel_path}")
 
 
@@ -851,6 +949,8 @@ def cmd_status(args):
 def cmd_takeover(args):
     """Local node comes online: sync from peer, then become primary.
     Use case: WSL boots up, needs to catch up and take over.
+    Epoch logic: read peer epoch, use max(local, peer)+1 to win any race.
+    Split-brain check: if both sides claim PRIMARY, warn but proceed (takeover is intentional).
     """
     node = get_node()
     lbl = node_label()
@@ -860,11 +960,24 @@ def cmd_takeover(args):
     print(f"  HA TAKEOVER: {lbl} initiating takeover")
     print("=" * 50)
 
+    # --- Epoch: check peer state for split-brain ---
+    is_conflict, peer_info, desc = check_split_brain()
+    peer_epoch = peer_info["epoch"] if peer_info else None
+    if peer_info:
+        print(f"  Peer state: {desc}")
+    if is_conflict:
+        log_event("error", f"Takeover with conflict: {desc}")
+        print(f"  ⚠️  SPLIT-BRAIN DETECTED — proceeding with takeover (epoch will supersede)")
+
+    # Calculate winning epoch BEFORE any state change
+    winning_epoch = resolve_epoch(peer_epoch)
+    print(f"  Epoch: local={get_epoch()}, peer={peer_epoch}, winning={winning_epoch}")
+
     if not pi_reachable():
         print(f"  {plbl} not reachable, assuming standalone mode")
-        set_role("primary", node.get("name", "wsl"))
-        log_event("takeover", f"{lbl} became primary (standalone — {plbl} unreachable)")
-        notify_user(f"\U0001f514 HA: {lbl} is now PRIMARY (standalone)")
+        set_role("primary", node.get("name", "wsl"), epoch=winning_epoch)
+        log_event("takeover", f"{lbl} became primary (standalone — {plbl} unreachable, epoch {winning_epoch})")
+        notify_user(f"\U0001f514 HA: {lbl} is now PRIMARY (standalone, epoch {winning_epoch})")
         return
 
     # 1. Pull and merge peer's data (peer was primary while we were offline)
@@ -910,12 +1023,12 @@ def cmd_takeover(args):
     # Clear stale heartbeat on peer (we are back online, will write fresh ones)
     ssh(f"rm -f {HEARTBEAT_FILE_REMOTE}")
 
-    # 4. Record state
+    # 4. Record state with winning epoch
     node_name = node.get("name", "wsl")
-    set_role("primary", node_name)
-    log_event("takeover", f"{lbl} is now PRIMARY (epoch {get_epoch()})")
-    notify_user(f"\U0001f514 HA: {lbl} is now PRIMARY")
-    print(f"\n  {lbl} is now PRIMARY. {plbl} is STANDBY.")
+    set_role("primary", node_name, epoch=winning_epoch)
+    log_event("takeover", f"{lbl} is now PRIMARY (epoch {winning_epoch})")
+    notify_user(f"\U0001f514 HA: {lbl} is now PRIMARY (epoch {winning_epoch})")
+    print(f"\n  {lbl} is now PRIMARY (epoch {winning_epoch}). {plbl} is STANDBY.")
     print("  Gateway running locally. All channels active.")
 
 
@@ -936,6 +1049,10 @@ def cmd_handoff(args):
         print("  Data will only be available locally.")
         log_event("error", f"Handoff FAILED: {plbl} unreachable")
         return
+
+    # Read peer epoch for resolve_epoch later
+    peer_ep_result = read_peer_epoch()
+    peer_ep = peer_ep_result["epoch"] if peer_ep_result else None
 
     # 1. Push all data to peer
     print("\n[1/4] Merging databases...")
@@ -967,11 +1084,12 @@ def cmd_handoff(args):
     print("\nStarting peer gateway...")
     start_pi_gateway()
 
-    # 4. Record state
-    set_role("offline", plbl.lower())
-    log_event("handoff", f"{lbl} handed off to {plbl} (epoch {get_epoch()})")
-    notify_user(f"\U0001f514 HA: {lbl} handed off, {plbl} is now PRIMARY")
-    print(f"\n  {plbl} is now PRIMARY. {lbl} is OFFLINE.")
+    # 4. Record state with resolved epoch
+    handoff_epoch = resolve_epoch(peer_ep)
+    set_role("offline", plbl.lower(), epoch=handoff_epoch)
+    log_event("handoff", f"{lbl} handed off to {plbl} (epoch {handoff_epoch})")
+    notify_user(f"\U0001f514 HA: {lbl} handed off, {plbl} is now PRIMARY (epoch {handoff_epoch})")
+    print(f"\n  {plbl} is now PRIMARY (epoch {handoff_epoch}). {lbl} is OFFLINE.")
     print(f"  Gateway running on {plbl}.")
 
 
@@ -1009,7 +1127,7 @@ def cmd_push(args):
     for d in SYNC_ITEMS["rsync_mirror"]:
         src = HERMES_HOME / d
         if src.exists():
-            local(f"rsync -az --timeout=10 {src}/ {PI_USER}@{PI_HOST}:/home/{PI_USER}/.hermes/{d}/ 2>/dev/null")
+            sync_rsync_mirror(d)  # uses SYNC_EXCLUDE internally
 
     push_primary_state()
 
