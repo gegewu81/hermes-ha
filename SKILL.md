@@ -128,8 +128,8 @@ Located at `~/.hermes/skills/devops/agent-ha/scripts/ha_sync.py`
 
 Environment variables (optional, override defaults):
 ```bash
-export HA_PI_HOST=PI_IP_PLACEHOLDER    # Pi IP
-export HA_PI_USER=ha_user           # Pi username
+export HA_PI_HOST=<YOUR_PI_IP>       # e.g. 192.168.1.x
+export HA_PI_USER=<YOUR_PI_USER>     # your Pi username
 export HA_HEARTBEAT_STALE=180      # Heartbeat stale threshold (seconds)
 ```
 
@@ -170,9 +170,9 @@ python3 ha_sync.py events -n 50 -t failover
 ha_sync.py uses passwordless SSH. Setup once:
 ```bash
 ssh-keygen -t ed25519 -C 'hermes-ha@wsl' -f ~/.ssh/id_ed25519 -N ''
-ssh-copy-id ha_user@PI_IP_PLACEHOLDER
+ssh-copy-id <YOUR_PI_USER>@<YOUR_PI_IP>
 # Verify:
-ssh -o BatchMode=yes ha_user@PI_IP_PLACEHOLDER 'echo OK'
+ssh -o BatchMode=yes <YOUR_PI_USER>@<YOUR_PI_IP> 'echo OK'
 ```
 
 ## Setup
@@ -181,15 +181,15 @@ ssh -o BatchMode=yes ha_user@PI_IP_PLACEHOLDER 'echo OK'
 
 ```bash
 ssh-keygen -t ed25519 -C 'hermes-ha@wsl' -f ~/.ssh/id_ed25519 -N ''
-ssh-copy-id ha_user@PI_IP_PLACEHOLDER
-# Verify: ssh -o BatchMode=yes ha_user@PI_IP_PLACEHOLDER 'echo OK'
+ssh-copy-id <YOUR_PI_USER>@<YOUR_PI_IP>
+# Verify: ssh -o BatchMode=yes <YOUR_PI_USER>@<YOUR_PI_IP> 'echo OK'
 ```
 
 Also add to `~/.ssh/config`:
 ```
 Host pi
-    HostName PI_IP_PLACEHOLDER
-    User ha_user
+    HostName <YOUR_PI_IP>
+    User <YOUR_PI_USER>
     IdentityFile ~/.ssh/id_ed25519
     ServerAliveInterval 30
     ConnectTimeout 5
@@ -236,8 +236,8 @@ WantedBy=default.target
 EOF
 
 # Deploy and activate
-scp /tmp/hermes-gateway.service ha_user@PI_IP_PLACEHOLDER:~/.config/systemd/user/
-ssh ha_user@PI_IP_PLACEHOLDER 'systemctl --user daemon-reload && systemctl --user enable hermes-gateway.service && loginctl enable-linger ha_user'
+scp /tmp/hermes-gateway.service <YOUR_PI_USER>@<YOUR_PI_IP>:~/.config/systemd/user/
+ssh <YOUR_PI_USER>@<YOUR_PI_IP> 'systemctl --user daemon-reload && systemctl --user enable hermes-gateway.service && loginctl enable-linger'
 ```
 **IMPORTANT:** Keep Environment= PATH short! Long PATH with node/bin caused 216/GROUP error.
 **IMPORTANT:** Must `systemctl --user enable` (not just daemon-reload). Without enable, Restart=on-failure won't work.
@@ -250,8 +250,8 @@ Deploy watchdog from WSL (avoids heredoc quoting issues):
 # Watchdog checks .ha_state every minute:
 #   Pi is primary → start gateway via systemd
 #   Pi is standby → stop gateway (safety net)
-scp ~/.hermes/skills/devops/agent-ha/scripts/ha_watchdog.sh ha_user@PI_IP_PLACEHOLDER:~/ha_watchdog.sh
-ssh ha_user@PI_IP_PLACEHOLDER 'chmod +x ~/ha_watchdog.sh && (echo "* * * * * ~/ha_watchdog.sh" | crontab -)'
+scp ~/.hermes/skills/devops/agent-ha/scripts/ha_watchdog.sh <YOUR_PI_USER>@<YOUR_PI_IP>:~/ha_watchdog.sh
+ssh <YOUR_PI_USER>@<YOUR_PI_IP> 'chmod +x ~/ha_watchdog.sh && (echo "* * * * * ~/ha_watchdog.sh" | crontab -)'
 ```
 
 ### 6. WSL systemd auto-takeover

@@ -3,3 +3,5 @@ __pycache__/
 *.bak
 *.bak.wsl
 .v1.bak
+.env
+.env.*

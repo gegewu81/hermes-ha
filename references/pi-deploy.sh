@@ -111,12 +111,12 @@ After=network-online.target
 
 [Service]
 Type=simple
-Environment=PATH=/home/ha_user/.local/bin:/usr/local/bin:/usr/bin:/bin
-Environment=HOME=/home/ha_user
-ExecStart=/home/ha_user/.local/bin/hermes gateway run --replace
+Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=$HOME
+ExecStart=$HOME/.local/bin/hermes gateway run --replace
 Restart=on-failure
 RestartSec=10
-WorkingDirectory=/home/ha_user
+WorkingDirectory=$HOME
 
 [Install]
 WantedBy=default.target

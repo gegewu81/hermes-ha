@@ -39,8 +39,11 @@ logger = logging.getLogger("ha_sync")
 # ============================================================
 # CONFIG — adjust these for your environment
 # ============================================================
-PI_HOST = os.environ.get("HA_PI_HOST", "PI_IP_PLACEHOLDER")
-PI_USER = os.environ.get("HA_PI_USER", "ha_user")
+PI_HOST = os.environ.get("HA_PI_HOST", "")
+PI_USER = os.environ.get("HA_PI_USER", "")
+if not PI_HOST or not PI_USER:
+    print("Error: HA_PI_HOST and HA_PI_USER must be set (via env vars or .env)")
+    sys.exit(1)
 PI_SSH = f"ssh -o BatchMode=yes -o ConnectTimeout=8 {PI_USER}@{PI_HOST}"
 PI_SCP = f"scp -o BatchMode=yes -o ConnectTimeout=8"
 
