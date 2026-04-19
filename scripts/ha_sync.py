@@ -6,7 +6,8 @@ Usage:
   python3 ha_sync.py status          # Show HA status with node identity
   python3 ha_sync.py takeover        # Local node takes over as primary
   python3 ha_sync.py handoff         # Local node hands off to peer
-  python3 ha_sync.py push            # Periodic push to peer (backup)
+  python3 ha_sync.py push            # Periodic push to peer (manual)
+  python3 ha_sync.py idle-push       # Smart push: idle > 10min or stale > 30min (cron)
   python3 ha_sync.py heartbeat       # Lightweight heartbeat to peer (cron)
   python3 ha_sync.py merge-db        # Merge SQLite databases (bidirectional)
   python3 ha_sync.py sync-version    # Check and fix version mismatch
@@ -39,12 +40,23 @@ logger = logging.getLogger("ha_sync")
 # ============================================================
 # CONFIG — adjust these for your environment
 # ============================================================
+HERMES_HOME = Path.home() / ".hermes"
+
+# Load .env file (cron doesn't inherit shell env vars)
+_ENV_FILE = HERMES_HOME / ".env"
+if _ENV_FILE.exists():
+    with open(_ENV_FILE) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _key, _val = _line.split("=", 1)
+                os.environ.setdefault(_key.strip(), _val.strip())
+
 PI_HOST = os.environ["HA_PI_HOST"]  # Required: set in ~/.hermes/.env
 PI_USER = os.environ["HA_PI_USER"]  # Required: set in ~/.hermes/.env
 PI_SSH = f"ssh -o BatchMode=yes -o ConnectTimeout=8 {PI_USER}@{PI_HOST}"
 PI_SCP = f"scp -o BatchMode=yes -o ConnectTimeout=8"
 
-HERMES_HOME = Path.home() / ".hermes"
 LOCK_FILE = HERMES_HOME / ".ha_lock"
 STATE_FILE = HERMES_HOME / ".ha_state"
 NODE_FILE = HERMES_HOME / ".ha_node"
@@ -54,7 +66,7 @@ MAX_EVENTS = 1000
 HEARTBEAT_FILE_REMOTE = f"/home/{PI_USER}/.hermes/.ha_heartbeat"
 # Heartbeat stale threshold in seconds. If Pi sees no heartbeat for this long,
 # WSL is considered offline and Pi will promote itself to primary.
-HEARTBEAT_STALE_SECONDS = int(os.environ.get("HA_HEARTBEAT_STALE", "180"))  # default 3 min
+HEARTBEAT_STALE_SECONDS = int(os.environ.get("HA_HEARTBEAT_STALE", "90"))  # default 1.5 min
 
 # Watermark file for incremental SQLite merge (tracks max PK per table)
 WATERMARK_FILE = HERMES_HOME / ".ha_watermark.json"
@@ -442,12 +454,55 @@ def get_events(count=20, event_type=None):
 # ============================================================
 # USER NOTIFICATION
 # ============================================================
-def notify_user(message):
-    """Send WeChat notification via hermes chat."""
-    try:
-        local(f"hermes chat -q {shlex.quote(message)}", timeout=30)
-    except Exception as e:
-        logger.warning("notify_user failed: %s", e)
+def _gateway_ready():
+    """Check if gateway is running and likely has channel connections established."""
+    stdout, rc = local("systemctl --user is-active hermes-gateway.service 2>/dev/null", timeout=5)
+    if rc != 0 or "active" not in stdout:
+        return False
+    # Gateway is active; give it a moment if it just started
+    return True
+
+
+def notify_user(message, max_retries=3, initial_delay=5, retry_delay=5):
+    """Send WeChat notification via hermes chat, with retry and delay.
+
+    Args:
+        message: Notification text to send.
+        max_retries: Number of retry attempts after initial failure.
+        initial_delay: Seconds to wait before first attempt (let gateway connect).
+        retry_delay: Seconds between retries.
+    """
+    import time
+    # NOTE: -Q must come BEFORE -q to avoid argparse treating -Q as -q's value
+    cmd = f"hermes chat -Q -q {shlex.quote(message)}"
+    time.sleep(initial_delay)
+    for attempt in range(1, max_retries + 2):
+        try:
+            r = subprocess.run(
+                cmd, shell=True, capture_output=False,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, timeout=30,
+            )
+            rc = r.returncode
+            if rc == 0:
+                logger.info("notify_user OK (attempt %d/%d)", attempt, max_retries + 1)
+                print(f"  Notification sent successfully (attempt {attempt}).")
+                return
+            else:
+                out = (r.stdout or "")[:200]
+                logger.warning("notify_user attempt %d failed: rc=%d, out=%s",
+                               attempt, rc, out or "(empty)")
+                print(f"  Notification attempt {attempt} failed (rc={rc}).")
+        except subprocess.TimeoutExpired:
+            logger.warning("notify_user attempt %d timed out", attempt)
+            print(f"  Notification attempt {attempt} timed out.")
+        except Exception as e:
+            logger.warning("notify_user attempt %d failed: %s", attempt, e)
+            print(f"  Notification attempt {attempt} failed: {e}")
+        if attempt <= max_retries:
+            print(f"  Retrying in {retry_delay}s...")
+            time.sleep(retry_delay)
+    print(f"  WARNING: Notification failed after {max_retries + 1} attempts.")
 
 
 # ============================================================
@@ -684,6 +739,11 @@ def merge_sqlite_incremental(db_name):
 
     print(f"  [merge] {db_name}")
 
+    # Check peer DB structural integrity before merge
+    if not check_peer_db_integrity(db_name):
+        print(f"    Peer {db_name} is corrupted (structural damage), replacing with local copy")
+        return replace_peer_db(db_name)
+
     # Get columns from local DB
     try:
         conn = sqlite3.connect(str(local_db))
@@ -897,8 +957,8 @@ def merge_sqlite_incremental(db_name):
                         f"count = 0\n"
                         f"with open('{delta_remote}') as f:\n"
                         f"    for line in f:\n"
-f"        vals = json.loads(line)\\n"
-                        f"        vals = [base64.b64decode(v['_bytes_b64']) if isinstance(v, dict) and '_bytes_b64' in v else v for v in vals]\\n"
+                        f"        vals = json.loads(line)\n"
+                        f"        vals = [base64.b64decode(v['_bytes_b64']) if isinstance(v, dict) and '_bytes_b64' in v else v for v in vals]\n"
                         f"        conn.execute('INSERT OR IGNORE INTO {table} (' + cl + ') VALUES (' + ph + ')', vals)\n"
                         f"        count += 1\n"
                         f"conn.commit()\n"
@@ -984,8 +1044,8 @@ f"        vals = json.loads(line)\\n"
                         f"count = 0\n"
                         f"with open('{delta_remote}') as f:\n"
                         f"    for line in f:\n"
-f"        vals = json.loads(line)\\n"
-                        f"        vals = [base64.b64decode(v['_bytes_b64']) if isinstance(v, dict) and '_bytes_b64' in v else v for v in vals]\\n"
+                        f"        vals = json.loads(line)\n"
+                        f"        vals = [base64.b64decode(v['_bytes_b64']) if isinstance(v, dict) and '_bytes_b64' in v else v for v in vals]\n"
                         f"        conn.execute('INSERT OR IGNORE INTO {table} (' + cl + ') VALUES (' + ph + ')', vals)\n"
                         f"        count += 1\n"
                         f"conn.commit()\n"
@@ -1011,119 +1071,242 @@ f"        vals = json.loads(line)\\n"
 
 
 # ============================================================
-# MERGE: SQLite full merge (legacy, used by takeover/handoff)
+# MERGE: SQLite full merge (used by takeover/handoff)
+# Uses INSERT OR IGNORE via sqlite3 API — safe with concurrent
+# gateway writes (WAL mode). Never scp/copy2 .db files while
+# gateway is running.
 # ============================================================
+def _push_rows_to_peer(db_name, table, cols):
+    """Push all local rows of a table to Pi via INSERT OR IGNORE.
+    Writes rows to a temp JSONL file, scp to Pi, then imports
+    via ssh_run_script. Safe with concurrent gateway writes.
+    Returns number of new rows inserted on peer.
+    """
+    col_list = ", ".join(f'"{c}"' for c in cols)
+    try:
+        conn = sqlite3.connect(str(HERMES_HOME / db_name))
+        rows = conn.execute(f'SELECT {col_list} FROM {table}').fetchall()
+        conn.close()
+    except sqlite3.Error:
+        return 0
+
+    if not rows:
+        return 0
+
+    safe_name = db_name.replace(".", "_")
+    delta_local = f"/tmp/ha_delta_{safe_name}_{table}.jsonl"
+    delta_remote = f"/tmp/ha_delta_{safe_name}_{table}.jsonl"
+
+    with open(delta_local, "w") as f:
+        for row in rows:
+            f.write(json.dumps(_row_to_json(row)) + "\n")
+
+    _, scp_rc = local(
+        f"{PI_SCP} {delta_local} {PI_USER}@{PI_HOST}:{delta_remote} 2>/dev/null"
+    )
+    new_to_peer = 0
+    if scp_rc == 0:
+        remote_import = (
+            f"import sqlite3, json, base64\n"
+            f"conn = sqlite3.connect('/home/{PI_USER}/.hermes/{db_name}')\n"
+            f"cols = {json.dumps(cols)}\n"
+            f"cl = ', '.join(cols)\n"
+            f"ph = ', '.join(['?'] * len(cols))\n"
+            f"count = 0\n"
+            f"with open('{delta_remote}') as f:\n"
+            f"    for line in f:\n"
+            f"        vals = json.loads(line)\n"
+            f"        vals = [base64.b64decode(v['_bytes_b64']) if isinstance(v, dict) and '_bytes_b64' in v else v for v in vals]\n"
+            f"        conn.execute('INSERT OR IGNORE INTO {table} (' + cl + ') VALUES (' + ph + ')', vals)\n"
+            f"        count += 1\n"
+            f"conn.commit()\n"
+            f"conn.close()\n"
+            f"print(count)"
+        )
+        out2, rc2 = ssh_run_script(remote_import, timeout=60)
+        if rc2 == 0:
+            try:
+                new_to_peer = int(out2.strip())
+            except ValueError:
+                new_to_peer = len(rows)
+
+    Path(delta_local).unlink(missing_ok=True)
+    ssh(f"rm -f {delta_remote}")
+    return new_to_peer
+
+
+def check_peer_db_integrity(db_name):
+    """Check peer DB structural integrity via PRAGMA integrity_check.
+    Returns True if OK, False if corrupted."""
+    check_script = (
+        f"import sqlite3\n"
+        f"try:\n"
+        f"    conn = sqlite3.connect('/home/{PI_USER}/.hermes/{db_name}')\n"
+        f"    result = conn.execute('PRAGMA integrity_check').fetchone()[0]\n"
+        f"    conn.close()\n"
+        f"    print(result)\n"
+        f"except Exception as e:\n"
+        f"    print(f'ERROR: {{e}}')\n"
+    )
+    out, rc = ssh_run_script(check_script, timeout=15)
+    if rc != 0:
+        return False
+    result = out.strip()
+    return result.lower() == "ok"
+
+
+def replace_peer_db(db_name):
+    """Safely replace corrupted peer DB with local healthy copy.
+    Stops Pi gateway first, scp, cleans WAL/SHM, restores gateway state.
+    Returns True on success."""
+    local_db = HERMES_HOME / db_name
+    if not local_db.exists():
+        print(f"    [replace] Local {db_name} not found, cannot replace peer")
+        return False
+
+    # Verify local DB is healthy before pushing
+    try:
+        conn = sqlite3.connect(str(local_db))
+        local_ok = conn.execute("PRAGMA integrity_check").fetchone()[0].lower() == "ok"
+        conn.close()
+    except sqlite3.Error:
+        local_ok = False
+
+    if not local_ok:
+        print(f"    [replace] Local {db_name} is also corrupted, skipping replace")
+        return False
+
+    print(f"    [replace] Replacing corrupted peer {db_name} with local copy...")
+    log_event("repair", f"Replacing corrupted peer {db_name} with local copy")
+
+    # Check if Pi gateway is running (to restore state after)
+    gw_out, _ = ssh("systemctl --user is-active hermes-gateway.service 2>/dev/null")
+    pi_gw_was_active = "active" in gw_out
+
+    # Stop Pi gateway to avoid concurrent writes
+    if pi_gw_was_active:
+        stop_pi_gateway()
+
+    # Backup corrupted DB on peer
+    ssh(f"cp /home/{PI_USER}/.hermes/{db_name} /home/{PI_USER}/.hermes/{db_name}.corrupted.bak 2>/dev/null")
+    # Clean WAL/SHM on peer
+    ssh(f"rm -f /home/{PI_USER}/.hermes/{db_name}-wal /home/{PI_USER}/.hermes/{db_name}-shm")
+
+    # SCP healthy DB
+    out, rc = local(f"{PI_SCP} {local_db} {PI_USER}@{PI_HOST}:/home/{PI_USER}/.hermes/{db_name} 2>/dev/null")
+    if rc != 0:
+        print(f"    [replace] SCP failed")
+        return False
+
+    # Clean WAL/SHM on peer again (SCP may leave stale files)
+    ssh(f"rm -f /home/{PI_USER}/.hermes/{db_name}-wal /home/{PI_USER}/.hermes/{db_name}-shm")
+
+    # Restore gateway state if it was active
+    if pi_gw_was_active:
+        start_pi_gateway()
+
+    # Verify replacement
+    if check_peer_db_integrity(db_name):
+        print(f"    [replace] Peer {db_name} replaced and verified OK")
+        # Reset watermarks for this DB since we did full replace
+        wm = load_watermark()
+        if db_name in wm:
+            del wm[db_name]
+            save_watermark(wm)
+        return True
+    else:
+        print(f"    [replace] WARNING: Peer {db_name} still corrupted after replace")
+        return False
+
+
 def merge_sqlite(db_name, incremental=False):
     """Merge a SQLite database between local and Pi.
     incremental=True: use watermarks, only transfer delta rows (for cron push).
-    incremental=False (default): full merge, copies entire DB (for takeover/handoff).
+    incremental=False (default): full row-level merge via INSERT OR IGNORE.
+    Both paths are safe with concurrent gateway writes (SQLite WAL mode).
     After full merge, resets watermarks to current max PKs."""
     if incremental:
         return merge_sqlite_incremental(db_name)
 
     local_db = HERMES_HOME / db_name
-    pi_db_local_copy = Path(f"/tmp/pi_{db_name}")
-    merged_db = Path(f"/tmp/merged_{db_name}")
-
     print(f"  [merge] {db_name}")
 
-    # 1. Pull Pi's DB
-    rc = local(f"{PI_SCP} {PI_USER}@{PI_HOST}:/home/{PI_USER}/.hermes/{db_name} {pi_db_local_copy} 2>/dev/null")[1]
-    if rc != 0:
-        print(f"    Pi DB not available, skipping merge")
-        return False
+    # Check peer DB structural integrity before merge
+    if not check_peer_db_integrity(db_name):
+        print(f"    Peer {db_name} is corrupted (structural damage), replacing with local copy")
+        return replace_peer_db(db_name)
 
-    # 2. Create merged copy from local
-    shutil.copy2(local_db, merged_db)
+    # Get columns from local DB
+    try:
+        conn = sqlite3.connect(str(local_db))
+    except sqlite3.Error as e:
+        print(f"    Cannot open local DB: {e}")
+        return False
 
     tables = MERGE_TABLES.get(db_name, {})
-    if not tables:
-        print(f"    No merge tables defined for {db_name}, copying latest")
-        local_mtime = get_db_mtime(db_name)
-        pi_mtime = get_db_mtime(db_name, remote=True)
-        if pi_mtime > local_mtime:
-            shutil.copy2(pi_db_local_copy, local_db)
-            print(f"    Pi DB is newer, copied to local")
-        return True
-
-    # 3. Merge each table
-    src_conn = sqlite3.connect(str(pi_db_local_copy))
-    src_conn.row_factory = sqlite3.Row
-    dst_conn = sqlite3.connect(str(merged_db))
-    dst_conn.row_factory = sqlite3.Row
-
-    total_new = 0
-    total_collisions = 0
-    for table, pk_cols in tables.items():
+    cols_by_table = {}
+    for table in tables:
         try:
-            # Get columns
-            cols = [r[1] for r in dst_conn.execute(f"PRAGMA table_info({table})").fetchall()]
-            if not cols:
-                continue
+            cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            if cols:
+                cols_by_table[table] = cols
+        except sqlite3.Error:
+            pass
+    conn.close()
 
-            # Get existing PKs in destination
-            pk_list = ", ".join(pk_cols)
-            existing_pks = set()
-            for row in dst_conn.execute(f"SELECT {pk_list} FROM {table}"):
-                if len(pk_cols) == 1:
-                    existing_pks.add(row[0])
-                else:
-                    existing_pks.add(tuple(row[i] for i in range(len(pk_cols))))
-
-            # Insert rows from Pi that don't exist in local
-            col_list = ", ".join(cols)
-            placeholders = ", ".join(["?"] * len(cols))
-            count = 0
-            collisions = 0
-            for row in src_conn.execute(f"SELECT {col_list} FROM {table}"):
-                # Check PK
-                if len(pk_cols) == 1:
-                    pk_val = row[list(cols).index(pk_cols[0])]
-                    pk_key = pk_val
-                else:
-                    pk_key = tuple(row[list(cols).index(c)] for c in pk_cols)
-
-                if pk_key not in existing_pks:
-                    values = [row[c] for c in cols]
-                    dst_conn.execute(f"INSERT OR IGNORE INTO {table} ({col_list}) VALUES ({placeholders})", values)
-                    count += 1
-                else:
-                    collisions += 1
-
-            total_new += count
-            total_collisions += collisions
-            print(f"    {table}: +{count} new rows from Pi, {collisions} collisions (PK already exists)")
-
-        except (sqlite3.Error, sqlite3.OperationalError) as e:
-            logger.error("Table %s merge error: %s", table, e)
-            print(f"    {table}: merge error: {e}")
-
-    dst_conn.commit()
-    src_conn.close()
-    dst_conn.close()
-
-    # 4. Push merged result to Pi FIRST (before replacing local)
-    _, push_rc = local(f"{PI_SCP} {merged_db} {PI_USER}@{PI_HOST}:/home/{PI_USER}/.hermes/{db_name} 2>/dev/null")
-    if push_rc != 0:
-        print(f"    WARNING: Failed to push merged DB to Pi (rc={push_rc}), NOT replacing local")
-        # Cleanup temp files but keep local DB untouched
-        pi_db_local_copy.unlink(missing_ok=True)
-        merged_db.unlink(missing_ok=True)
+    if not cols_by_table:
+        print(f"    No tables found")
         return False
 
-    print(f"    Pushed merged DB to Pi")
+    total_new = 0
 
-    # 5. Only replace local after Pi push succeeded
-    shutil.copy2(merged_db, local_db)
-    print(f"    Replaced local DB ({total_new} total new rows, {total_collisions} collisions)")
+    for table, pk_cols in tables.items():
+        cols = cols_by_table.get(table)
+        if not cols:
+            continue
 
-    # Cleanup
-    pi_db_local_copy.unlink(missing_ok=True)
-    merged_db.unlink(missing_ok=True)
+        col_list = ", ".join(f'"{c}"' for c in cols)
+        placeholders = ", ".join(["?"] * len(cols))
 
-    # Reset watermarks to current max PKs (both sides now identical)
+        # (a) Pull all rows from Pi via SQL, INSERT OR IGNORE locally
+        remote_pull = (
+            f"import sqlite3, json, base64\n"
+            f"conn = sqlite3.connect('/home/{PI_USER}/.hermes/{db_name}')\n"
+            f"rows = conn.execute('SELECT {col_list} FROM {table}').fetchall()\n"
+            f"for row in rows:\n"
+            f"    print(json.dumps(_row_to_json(row)))\n"
+            f"conn.close()"
+        )
+        out, rc = ssh_run_script(remote_pull, timeout=60)
+
+        new_from_peer = 0
+        if rc == 0 and out.strip():
+            try:
+                conn = sqlite3.connect(str(local_db))
+                for line in out.strip().split("\n"):
+                    try:
+                        values = _row_from_json(json.loads(line))
+                        conn.execute(
+                            f'INSERT OR IGNORE INTO {table} ({col_list}) '
+                            f'VALUES ({placeholders})', values
+                        )
+                        new_from_peer += 1
+                    except (json.JSONDecodeError, sqlite3.Error):
+                        pass
+                conn.commit()
+                conn.close()
+            except sqlite3.Error as e:
+                logger.warning("Pull table failed for %s.%s: %s", db_name, table, e)
+
+        # (b) Push all local rows to Pi, INSERT OR IGNORE there
+        new_to_peer = _push_rows_to_peer(db_name, table, cols)
+
+        total_new += new_from_peer + new_to_peer
+        print(f"    {table}: +{new_from_peer} from peer, +{new_to_peer} to peer (full row exchange)")
+
+    # Reset watermarks to current max PKs (both sides now have same data)
     reset_watermarks()
-
+    print(f"    [full] {total_new} total new rows")
     return True
 
 
@@ -1431,16 +1614,23 @@ def cmd_takeover(args):
         notify_user(f"\U0001f514 HA: {lbl} is now PRIMARY (standalone, epoch {winning_epoch})")
         return
 
-    # 1. Pull and merge peer's data (peer was primary while we were offline)
-    print("\n[1/5] Merging databases...")
+    # 1. Stop peer's gateway FIRST to prevent concurrent writes during merge.
+    # (merge is now safe with concurrent writes via INSERT OR IGNORE,
+    #  but stopping gateway early is good defensive practice — reduces
+    #  lock contention and avoids Pi generating new data mid-merge.)
+    print("\n[1/6] Stopping peer gateway...")
+    stop_pi_gateway()
+
+    # 2. Pull and merge peer's data (peer was primary while we were offline)
+    print("\n[2/6] Merging databases...")
     for db in SYNC_ITEMS["sqlite_merge"]:
         merge_sqlite(db)
 
-    print("\n[2/5] Syncing text files...")
+    print("\n[3/6] Syncing text files...")
     for f in SYNC_ITEMS["text_latest_wins"]:
         sync_text_latest_wins(f)
 
-    print("\n[3/5] Syncing directories...")
+    print("\n[4/6] Syncing directories...")
     for d in SYNC_ITEMS["rsync_mirror"]:
         sync_rsync_mirror(d)
 
@@ -1460,15 +1650,11 @@ def cmd_takeover(args):
     except (ImportError, OSError) as e:
         print(f"  [warn] config merge failed: {e}")
 
-    print("\n[4/5] Pulling channel state from peer...")
+    print("\n[5/6] Pulling channel state from peer...")
     pull_primary_state()
 
-    # 2. Stop peer's gateway
-    print("\n[5/5] Stopping peer gateway...")
-    stop_pi_gateway()
-
     # 3. Ensure local gateway is running
-    print("\nEnsuring local gateway is running...")
+    print("\n[6/6] Starting local gateway...")
     start_local_gateway()
 
     # Write a FRESH heartbeat instead of clearing it.
@@ -1546,9 +1732,67 @@ def cmd_handoff(args):
     print(f"  Gateway running on {plbl}.")
 
 
+def _get_last_user_activity():
+    """Return unix timestamp of the most recent user message in state.db.
+    Returns 0 if DB is empty, missing, or has no user messages."""
+    db_path = HERMES_HOME / "state.db"
+    try:
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute(
+            "SELECT MAX(timestamp) FROM messages WHERE role = 'user'"
+        ).fetchone()
+        conn.close()
+        return float(row[0]) if row and row[0] else 0
+    except (sqlite3.Error, TypeError, ValueError):
+        return 0
+
+
+def cmd_idle_push(args):
+    """Smart push: trigger push only when user is idle or data is stale.
+
+    Designed to replace fixed-interval cron push with event-driven sync:
+    - Idle trigger: user has not sent a message for > 10 minutes → push
+    - Timeout trigger: last push was > 30 minutes ago → push regardless
+    - Debounce: at least 2 minutes since last push (avoids lock contention
+      with heartbeat which runs every 2 minutes)
+
+    Runs from cron every minute. Most invocations are no-op (just one
+    DB query + one JSON file read). Actual push happens only when needed.
+
+    This means data syncs shortly after the user stops interacting,
+    and has a 30-minute hard ceiling for continuous use scenarios.
+    """
+    now = time.time()
+
+    # Check role — only primary pushes
+    state = get_role()
+    if state.get("role") != "primary":
+        return
+
+    # Debounce: skip if last push was < 2 minutes ago
+    last_sync = state.get("last_sync", 0)
+    since_last_sync = now - last_sync
+    if since_last_sync < 120:
+        return
+
+    # Get last user activity
+    last_activity = _get_last_user_activity()
+    idle_seconds = now - last_activity if last_activity > 0 else float("inf")
+
+    # Decision: idle > 10min OR last push > 30min
+    if idle_seconds > 600 or since_last_sync > 1800:
+        reason = []
+        if idle_seconds > 600:
+            reason.append(f"idle {int(idle_seconds/60)}min")
+        if since_last_sync > 1800:
+            reason.append(f"stale {int(since_last_sync/60)}min")
+        print(f"[{time.strftime('%H:%M:%S')}] idle-push triggered ({', '.join(reason)})")
+        cmd_push(args)
+
+
 def cmd_push(args):
     """Periodic push: sync local data to/from peer while local is primary.
-    Use case: cron job every 30 min while local is online.
+    Use case: called by idle-push (cron) or manually.
     SQLite DBs use bidirectional merge (INSERT OR IGNORE) to preserve any
     rows written on the peer (e.g. Holographic memory hooks on standby).
     """
@@ -1701,7 +1945,8 @@ def main():
     sub.add_parser("status", help="Show HA status with node identity")
     sub.add_parser("takeover", help="Local node takes over as primary")
     sub.add_parser("handoff", help="Local node hands off to peer")
-    sub.add_parser("push", help="Periodic push to peer (cron)")
+    sub.add_parser("push", help="Periodic push to peer (manual or called by idle-push)")
+    sub.add_parser("idle-push", help="Smart push: only when idle > 10min or stale > 30min (cron)")
     sub.add_parser("heartbeat", help="Lightweight heartbeat to peer (cron)")
     sub.add_parser("sync-version", help="Check and fix version mismatch")
     merge_p = sub.add_parser("merge-db", help="Merge a specific database")
@@ -1739,6 +1984,8 @@ def main():
             cmd_handoff(args)
         elif args.command == "push":
             cmd_push(args)
+        elif args.command == "idle-push":
+            cmd_idle_push(args)
         elif args.command == "heartbeat":
             cmd_heartbeat(args)
         elif args.command == "merge-db":

@@ -79,7 +79,7 @@ description: Hermes Agent hot-standby HA system. WSL as primary (when online), P
 |----------|------|----------|-----|
 | **SQLite** | state.db, memory_store.db | Row-level merge | Both sides may accumulate new data during split |
 | **Text** | MEMORY.md, USER.md, SOUL.md | Latest mtime wins | Single-file, last-write semantics |
-| **Dirs** | skills/, sessions/ | rsync bidirectional (add-only) | Append-only, no conflicts |
+| **Dirs** | skills/, sessions/ | rsync bidirectional (--update) | Append-only, no conflicts. ha_sync.py excluded (bootstrap paradox) |
 | **Channels** | weixin/, pairing/, channel_directory.json | Primary-only push | Only active GW writes these |
 | **Shared Config** | config.shared.yaml | Primary push + config_merge | Keeps behavioral config identical on both sides |
 
@@ -131,6 +131,10 @@ Located at `~/.hermes/skills/devops/agent-ha/scripts/ha_sync.py`
 - User notification on role changes (`hermes chat -q`)
 - New commands: `init-node`, `events` (-n count, -t type filter)
 
+**v2.1 changes (2026-04-19):**
+- `SYNC_EXCLUDE` reduced to only `ha_sync.py` (bootstrap paradox — sync engine can't sync itself)
+- Other HA scripts (watchdog, config_merge, gen_shared) removed from exclude — auto-propagate via rsync --update
+
 Environment variables (optional, override defaults):
 ```bash
 export HA_PI_HOST=PI_IP_PLACEHOLDER    # Pi IP
@@ -153,7 +157,11 @@ python3 ha_sync.py takeover
 # WSL going offline → hand off to Pi
 python3 ha_sync.py handoff
 
-# Periodic backup (cron, every 30min)
+# Smart push: idle > 10min or stale > 30min (cron, every minute)
+# Most invocations are no-op; actual push only when needed
+python3 ha_sync.py idle-push
+
+# Direct push (manual, or called by idle-push internally)
 python3 ha_sync.py push
 
 # Lightweight heartbeat (cron, every 2min) — signals local node is alive to peer
@@ -208,14 +216,22 @@ Host pi
 chmod +x ~/.hermes/skills/devops/agent-ha/scripts/ha_sync.py
 ```
 
-### 3. WSL cron — periodic push + heartbeat
+### 3. WSL cron — idle-push + heartbeat
 
 ```bash
 mkdir -p ~/.hermes/logs
-(crontab -l 2>/dev/null; echo "*/30 * * * * /usr/bin/python3 ~/.hermes/skills/devops/agent-ha/scripts/ha_sync.py push >> ~/.hermes/logs/ha_push.log 2>&1") | crontab -
+# idle-push every minute: triggers actual push only when idle > 10min or stale > 30min
+(crontab -l 2>/dev/null; echo "* * * * * /usr/bin/python3 ~/.hermes/skills/devops/agent-ha/scripts/ha_sync.py idle-push >> ~/.hermes/logs/ha_push.log 2>&1") | crontab -
 # Heartbeat every 2 minutes — lightweight SSH, signals WSL is alive to Pi watchdog
 (crontab -l 2>/dev/null; echo "*/2 * * * * /usr/bin/python3 ~/.hermes/skills/devops/agent-ha/scripts/ha_sync.py heartbeat >> ~/.hermes/logs/ha_heartbeat.log 2>&1") | crontab -
 ```
+
+**idle-push replaces the old fixed-interval push.** It runs every minute but only triggers an actual push when:
+- User has been idle (no `role='user'` message) for > 10 minutes, OR
+- Last push was > 30 minutes ago (hard ceiling for continuous use)
+- Debounce: at least 2 minutes since last push (avoids lock contention with heartbeat)
+
+Result: data syncs shortly after the user stops interacting, with a 30-minute worst-case ceiling during continuous use. Most cron invocations are no-op (just one DB query + one JSON read).
 
 ### 4. Pi gateway systemd service
 
@@ -373,7 +389,7 @@ If both sides ran independently and accumulated data:
 - [x] `takeover` command tested — works (merges Pi data, stops Pi GW, starts WSL GW)
 - [x] `handoff` command tested — works (pushes data, stops WSL GW, starts Pi GW via systemd)
 - [x] Pi watchdog (`ha_watchdog.sh`) — deployed to Pi, cron every minute, **heartbeat-based failover**
-- [x] WSL cron (periodic push) — set up, every 30 minutes
+- [x] WSL cron (idle-push) — every minute check, push only when idle > 10min or stale > 30min (replaced fixed 30min push)
 - [x] WSL cron (heartbeat) — set up, every 2 minutes
 - [x] WSL systemd auto-takeover service — enabled (hermes-ha-takeover.service)
 - [x] SSH key auth — set up (ed25519, passwordless)
@@ -416,21 +432,163 @@ If both sides ran independently and accumulated data:
 13. **rsync --update for bidirectional sync** — plain `rsync -a` overwrites newer files on the receiving side. Adding `--update` (`rsync -a --update`) skips files that are newer on receiver, preventing accidental data overwrite during split-brain recovery.
 14. **config change workflow** — after editing config on WSL, if core sections changed (memory/skills/approvals etc.), must regenerate shared + push to Pi, otherwise Pi keeps old values. Run `gen_shared.py` → `push`.
 15. **CRITICAL: Pi gateway service must be `enabled`** — `systemctl --user enable hermes-gateway.service` is required for `Restart=on-failure` to work. Initial deployment only did `daemon-reload` but forgot `enable`. Without enable, the service is "disabled" — first failure is permanent, watchdog's `systemctl start` runs but the service won't auto-restart after crashes. Fix: `ssh pi 'systemctl --user enable hermes-gateway.service'`.
-16. **WSL shutdown → Pi auto-failover via heartbeat** — WSL writes heartbeat timestamp to Pi every 2min. Pi watchdog (every 1min) checks heartbeat age. If stale > 180s, Pi auto-promotes to primary and starts gateway. Max failover delay: ~3 minutes. No need for explicit handoff before WSL shutdown. Takeover clears stale heartbeat to prevent false failover.
+16. **WSL shutdown → Pi auto-failover via heartbeat** — WSL writes heartbeat timestamp to Pi every 2min. Pi watchdog (every 1min) checks heartbeat age. If stale > 180s (HEARTBEAT_THRESHOLD), Pi auto-promotes to primary and starts gateway. Max failover delay: ~3 minutes. No need for explicit handoff before WSL shutdown. Takeover clears stale heartbeat to prevent false failover.
+45. **Watchdog threshold must be > heartbeat interval** — Default HEARTBEAT_THRESHOLD is 180s (was 90s, caused excessive failovers). With 2-minute heartbeat interval, 90s threshold triggers on every single missed heartbeat (26 promotes in one day observed 2026-04-19). Rule: threshold should be at least 1.5× the heartbeat interval to tolerate one missed cycle.
 17. **Pi gateway first-start may fail with exit 1** — Observed at 09:12 CST 2026-04-18: Pi gateway started by watchdog but exited after 1s with code=exited, status=1. No clear error in journal (just "Hermes Gateway Starting..." then immediate exit). Possible causes: race condition with WSL takeover (WSL may have been shutting down Pi gateway simultaneously), or platform connection failure. Subsequent manual start worked fine. The `Restart=on-failure` + `enable` fix (pitfall #15) should handle this going forward.
 18. **Config values in shared sections must be edited in config.shared.yaml too** — If you change a shared-section value (e.g. `persistent_retry_interval`) directly in `config.yaml`, the next `push` will overwrite it back from `config.shared.yaml`. Always edit both `config.yaml` AND `config.shared.yaml`, then push. Or edit only `config.shared.yaml`, then run `config_merge.py` to apply locally, then push.
 19. **Epoch split-brain prevention (RESOLVED in v2)** — `resolve_epoch(peer_epoch)` calculates max(local, peer)+1. `check_split_brain()` detects dual-primary conflicts via SSH. `cmd_takeover()` reads peer epoch before claiming primary. `set_role()` accepts explicit `epoch=` parameter. Watchdog v2 writes epoch on promote. See code: `read_peer_epoch()`, `resolve_epoch()`, `check_split_brain()`.
 20. **Python 3.13 .pyc recovery when source is overwritten** — If Pi writes v2 code but WSL push overwrites it with v1, `__pycache__/*.cpython-313.pyc` may still contain v2. Recovery: `import importlib.util; spec = importlib.util.spec_from_file_location("mod", "path/to.pyc"); mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)`. Then extract via introspection: `[f for f in dir(mod) if callable(getattr(mod, f)) and hasattr(getattr(mod, f), "__code__")]` for functions, `fn.__code__.co_consts` for strings, `fn.__doc__` for docstrings. **CANNOT decompile** Python 3.13 bytecode — uncompyle6, decompyle3, pycdc all fail. Reconstruct from v1 source + extracted v2 metadata.
-21. **CRITICAL: rsync -az overwrites newer files, destroying code updates on peer** — This was the ROOT CAUSE of Pi's v2 being silently replaced by WSL's v1 during takeover/push. `rsync -a` does NOT protect newer destination files. Fix (two layers): (a) `SYNC_EXCLUDE` list in ha_sync.py excludes 5 HA scripts from all rsync — code changes must be deployed explicitly via `scp`, never auto-synced. (b) `rsync -az --update` as safety net to skip files newer on receiver. `cmd_push()` now calls `sync_rsync_mirror()` instead of inline rsync, ensuring excludes apply everywhere.
+21. **rsync -az --update protects newer files on peer** — `rsync -a` does NOT protect newer destination files. Fix: `rsync -az --update` skips files newer on receiver. `ha_sync.py` stays in `SYNC_EXCLUDE` (bootstrap paradox — the sync engine cannot safely sync itself). Other HA scripts (watchdog, config_merge, gen_shared) are safe to auto-propagate via rsync --update since they're not running during sync.
 22. **Watchdog demote gate: must check role=primary, not just gateway running** — Original watchdog v2 only entered the demote branch when `GW_RUNNING=YES`. If Pi was primary but gateway was already stopped (e.g. WSL takeover stopped it), watchdog would skip demote entirely — Pi stays "primary" in state even though WSL is online. Fix: separate the role demote check (`if [ "$ROLE" = "primary" ]`) from the gateway stop check (`if [ "$GW_RUNNING" = "YES" ]`). Always write standby state when WSL heartbeat is fresh, regardless of gateway status.
 23. **CRITICAL: Cron DBUS_SESSION_BUS_ADDRESS missing — systemctl --user silently fails** — Cron jobs don't inherit `DBUS_SESSION_BUS_ADDRESS` or `XDG_RUNTIME_DIR` from the user session. Without these, `systemctl --user start/stop/is-active` all fail with "Failed to connect to user scope bus" but the script continues (pipes to /dev/null). The watchdog thinks gateway started when it actually didn't. Fix: auto-detect in ha_watchdog.sh header: `export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"`. This was the root cause of Pi failover failing silently for 10+ minutes — gateway promoted to PRIMARY but never actually started.
 24. **Cron push SQLite must use merge, not scp overwrite** — Original `cmd_push()` used plain `scp` to copy SQLite DBs to Pi. If Pi standby accumulated new rows (e.g. Holographic memory hooks), scp overwrite would destroy them silently. Fix: `cmd_push()` now calls `merge_sqlite()` (same as takeover) — pulls Pi DB, merges rows via INSERT OR IGNORE, pushes merged result back. Trade-off: ~5s slower per push cycle due to merge processing, but eliminates silent data loss.
-25. **iLink sendmessage API returns HTTP 200 `{}` but does NOT actually deliver without active WebSocket** — Calling `ilink/bot/sendmessage` directly via HTTP returns 200 with empty JSON `{}`, which looks like success (no `ret`/`errcode` keys), but the message is never delivered to the user. Messages only go through when gateway's WebSocket long-poll connection is active. **Do NOT use ha_send_weixin.py for notifications — it doesn't work.** `hermes chat -q` is the only way to send through the gateway's active WebSocket, but the agent processes the message (adds fluff). No reliable direct-push method exists without gateway running.
+25. **iLink sendmessage API returns HTTP 200 `{}` but does NOT actually deliver without active WebSocket** — Calling `ilink/bot/sendmessage` directly via HTTP returns 200 with empty JSON `{}`, which looks like success (no `ret`/`errcode` keys), but the message is never delivered to the user. Messages only go through when gateway's WebSocket long-poll connection is active. **Do NOT use ha_send_weixin.py for notifications — it doesn't work.** `hermes chat -Q -q` is the only way to send through the gateway's active WebSocket, but the agent processes the message (adds fluff). No reliable direct-push method exists without gateway running.
+43. **notify_user needs initial_delay + retry — gateway WebSocket not ready immediately after start** — When systemd starts the gateway, the WeChat WebSocket takes 5-10s to connect. If `notify_user()` fires right after `start_local_gateway()`, `hermes chat -Q -q` returns rc=0 but the message is silently dropped (WebSocket not yet established). Fix (2026-04-19): `notify_user()` now has `initial_delay=5` (wait for WebSocket) and `max_retries=3, retry_delay=5` (retry if failed). Total worst case: 5 + 4*30 = 125s, fits within systemd `TimeoutStartSec=180`. Also: `-Q` flag must come BEFORE `-q` in the command — argparse treats `-Q` as `-q`'s argument value if placed after. Use `hermes chat -Q -q "msg"`, NOT `hermes chat -q -Q "msg"`. Must use `stdin=subprocess.DEVNULL` in subprocess.run to prevent hermes chat from blocking on stdin read.
+44. **Pi watchdog already handles gateway-not-ready delay** — Pi's `ha_watchdog.sh` starts gateway, `sleep 5`, then `sleep 3`, then notifies. This approach and WSL's `notify_user(initial_delay=5)` achieve the same goal via different mechanisms. Both are safe — Pi uses shell sleep, WSL uses Python time.sleep in notify_user. No conflict since they run on different nodes.
 26. **Cron push SQLite must use merge, not scp overwrite**
 27. **FTS5 index corruption in state.db — repair procedure** — `messages_fts` (FTS5 virtual table, `content=messages`) can corrupt due to interrupted writes (HA merge during failover, WSL sudden shutdown). Symptom: `session_search` returns "database disk image is malformed". Diagnosis: `PRAGMA integrity_check` shows ~100 errors on Tree 12 (messages_fts_data). **Original data is safe** — `sessions` and `messages` tables are unaffected; only the search index is broken. FTS tables are NOT in `MERGE_TABLES`, so HA sync (push/takeover/handoff) never touches them — each side must rebuild independently. Repair SQL (run on each node separately): `DELETE FROM messages_fts; INSERT INTO messages_fts(rowid, content) SELECT id, content FROM messages; REINDEX messages_fts;`. Verify with `SELECT count(*) FROM messages_fts`. Alternatively, drop and recreate: `DROP TABLE messages_fts; CREATE VIRTUAL TABLE messages_fts USING fts5(content, content=messages, content_rowid=id); INSERT INTO messages_fts(rowid, content) SELECT id, content FROM messages;`.
 28. **Config YAML supports ${VAR} env interpolation** — Hermes config.yaml natively supports `${VAR}` references via `_expand_env_vars()` in `hermes_cli/config.py`. Values are resolved from `os.environ` at load time. `.env` file variables are loaded into environment before config parse. Use this for API keys: store key in `.env`, reference in config.yaml as `${GLM_API_KEY}`. Note: `mcp_servers` is an environment-specific section — not synced via `config.shared.yaml`. Each node must have its own `.env` with the key.
 29. **CRITICAL: SCP state.db while gateway running causes corruption** — Never scp a rebuilt state.db to a node while its gateway is running. Pi's Holographic `on_pre_compress` hook writes to state.db even in standby mode. If scp overwrites the DB mid-write, the result is a corrupted file (including base tables, not just FTS). **Correct procedure to push a rebuilt DB:** (1) Stop gateway on target, (2) scp the rebuilt state.db, (3) Delete WAL/SHM files on target (stale WAL from pre-scp writes will corrupt even a valid replacement), (4) Restart gateway. Discovered 2026-04-18 when WSL's scp of rebuilt state.db to Pi produced corruption despite the source being integrity-ok.
-30. **WAL/SHM files silently corrupt valid DB replacements** — SQLite WAL and SHM files persist alongside the main `.db` file. Replacing the `.db` via scp/cp leaves old `-wal`/`-shm` files. SQLite opens the new DB, finds old WAL, tries to replay it — corruption. Symptom: `PRAGMA integrity_check` returns "malformed" even though replacement passed check in isolation (open with `file:path?mode=ro` to verify). **Always delete after replacing any SQLite file:** `rm -f state.db-wal state.db-shm`.
+30. **WAL/SHM files silently corrupt valid DB replacements** — SQLite WAL and SHM files persist alongside the main `.db` file. Replacing the `.db` via scp/cp leaves old `-wal`/`-shm` files. SQLite opens the new DB, finds old WAL, tries to replay it — corruption. Symptom: `PRAGMA integrity_check` returns \"malformed\" even though replacement passed check in isolation (open with `file:path?mode=ro` to verify). **Always delete after replacing any SQLite file:** `rm -f state.db-wal state.db-shm`.
+31. **CRITICAL: shlex.quote() breaks multi-line Python in SSH** — `shlex.quote()` wraps in single quotes, which cannot span newlines in bash. All `ssh(\"python3 -c \" + shlex.quote(code))` calls in ha_sync.py silently produced bash parse errors, returning empty/stub output. Fix (2026-04-18): added `ssh_run_script()` helper — writes code to temp file, scp to Pi, execute, cleanup. Replaced 6 occurrences. **Symptom**: incremental merge shows `+0 from peer` despite Pi having newer data (e.g. facts 15-21). Watermark is saved based on the (empty) result, permanently skipping those rows until watermark is manually reset.
+32. **CRITICAL: Never scp state.db while Pi gateway is running** — If Pi's gateway process is writing to state.db while WSL scp overwrites it, the WAL/SHM files become inconsistent with the new main DB, causing B-tree corruption (`PRAGMA integrity_check` shows ~100 errors on FTS5 trees). Pi gateway writes to WAL first; if the main file is replaced mid-write, WAL references stale pages. **Always stop Pi gateway before scp state.db**: `ssh pi 'systemctl --user stop hermes-gateway.service'` → scp → `ssh pi 'systemctl --user start hermes-gateway.service'`. Or better: use `merge_sqlite()` via INSERT OR IGNORE which is safe with concurrent reads/writes. This was the root cause of Pi state.db corruption on 2026-04-18.
+33. **CRITICAL: scp does truncate+write (same inode), NOT rename** — Verified experimentally 2026-04-19: `scp` preserves the target file's inode (truncate + rewrite), unlike `mv`/`rename` which creates a new inode. When gateway holds an open fd to state.db, scp's truncate immediately affects the fd — gateway's in-memory B-tree cache becomes stale relative to new on-disk content. On next commit/checkpoint, gateway writes stale page structures → B-tree corruption (Rowid out of order, invalid page number). **INSERT OR IGNORE via sqlite3 API is safe** (experimentally verified: integrity=ok, zero data loss). **scp/copy2 of .db files is NEVER safe while any process has the DB open.**
+34. ~~**CRITICAL BUG: merge_sqlite(full) still uses scp**~~ **[RESOLVED 2026-04-18]** — `merge_sqlite(full)` now uses INSERT OR IGNORE via sqlite3 API for both pull (SSH SQL query → json → local INSERT OR IGNORE) and push (`_push_rows_to_peer()` → JSONL file → scp → remote INSERT OR IGNORE). No .db files are transferred via scp/copy2. `cmd_takeover()` also stops Pi gateway BEFORE merge (step [1/6]) as defensive practice. All paths are safe with concurrent gateway writes.
+35. **CRITICAL: ha_sync.py must self-load .env** — Cron doesn't inherit shell env vars (.bashrc/.profile). Scripts called by cron via `/usr/bin/python3` don't get `HA_PI_HOST`/`HA_PI_USER`. Fix (2026-04-19): added `.env` auto-loader at module level in ha_sync.py after `HERMES_HOME` definition. Uses `os.environ.setdefault()` so existing env vars take precedence.
+42. **Auto-repair: peer DB structural corruption detected during push/takeover** — `merge_sqlite()` (both full and incremental) now runs `PRAGMA integrity_check` on peer DB before merge. If corrupted (B-tree damage, page errors, etc.), automatically replaces with local healthy copy via safe path: check local integrity → stop Pi gateway (if running) → backup corrupted file → scp clean DB → clean WAL/SHM → restore gateway state → verify. Watermarks reset for replaced DB. Logged as event type `repair`. Functions: `check_peer_db_integrity()`, `replace_peer_db()`. Tested 2026-04-19: Pi memory_store.db B-tree corruption (Tree 2 page 61) auto-repaired during push.
+36. **Full root cause chain for 2026-04-18 state.db corruption** — (a) .env not auto-loaded → cron heartbeat fails from 21:20 → (b) Pi watchdog detects heartbeat timeout, promotes to primary every ~3min → (c) WSL restarts, systemd auto-starts gateway, takeover executes → (d) takeover's full merge does scp overwrite of both Pi and WSL state.db while both gateways running → (e) B-tree corruption on both sides → (f) repeated takeover (8 times in one evening) each scp overwrites increasingly corrupted DBs → cumulative damage. Watermarks also corrupted (reset to 0 because reset_watermarks() can't read MAX(id) from malformed DB). Cron's default PATH (`/usr/bin:/bin`) is sufficient — ssh/scp/rsync/python3 all in /usr/bin. No PATH issue.
+37. **Reset watermarks after DB rebuild** — After rebuilding state.db from scratch or replacing it, `reset_watermarks()` may read MAX(id) from a malformed DB and get 0 (default). Manually set watermark to correct values in `~/.hermes/.ha_watermark.json` before running incremental push, otherwise all existing rows are treated as "new" and re-inserted (harmless but slow), or worse, watermark gets saved as 0 causing push to never pick up genuinely new rows correctly.
+38. **FTS5 rebuild syntax is NOT `REBUILD table`** — SQLite FTS5 uses `INSERT INTO table(table) VALUES('rebuild')` syntax. `REBUILD messages_fts` causes syntax error. Same for integrity check: `INSERT INTO messages_fts(messages_fts) VALUES('integrity-check')`.
+39. **CRITICAL: `\\\\n` vs `\\n` in f-string remote_import templates — silent data loss** — In Python f-strings, `\\\\n` produces literal `\n` (two chars), not a newline. If a `remote_import` template sent to `ssh_run_script()` contains `\\\\n`, the remote Python script gets a syntax error (`unexpected character after line continuation`), returns rc!=0, and the `except ValueError` fallback silently sets `new_to_peer = len(rows)` — making the caller think rows were pushed when they weren't. This affected `merge_sqlite_incremental()` integer PK push-to-peer (L911-912) and composite PK push-to-peer (L997-998). Symptom: `fact_entities: +0 to peer` despite having rows to push, and watermark not advancing. Fix (2026-04-19): all remote_import templates must use `\\n` consistently (same as `_push_rows_to_peer()` L1070). Always `cat -A` the source to verify — `\\n` shows as `\\n` in cat output, `\\\\n` shows as `\\\\n`.
+40. **Planned: String PK incremental merge — sessions table bottleneck** — Session IDs are lexicographically sortable timestamps (e.g. `20260419_081052_4c4a93`), so `WHERE id > 'watermark'` works correctly with string comparison. Current code falls back to full row exchange for string PK tables (L749-830 in ha_sync.py), pulling ALL 232+ sessions from Pi on every push. Fix: treat string PK same as integer PK for incremental merge — just use string comparison instead of numeric. This was analyzed 2026-04-19 but not yet implemented.
+41. ~~**Planned: push --fast mode**~~ **[RESOLVED 2026-04-19] — Implemented as `idle-push` instead.** Rather than a `--fast` flag, implemented `cmd_idle_push()` which runs every minute from cron but only triggers actual push when: (a) user idle > 10min (no `role='user'` message in state.db), or (b) last push > 30min ago (hard ceiling). Debounce of 2 minutes prevents lock contention with heartbeat. Most invocations are no-op (just one DB query + one JSON read). This achieves the same goal as `--fast` (reduce unnecessary push frequency) but with smarter triggering based on user activity. Note: Hermes doesn't flush messages to state.db in real-time during a conversation, so idle-push may trigger during long sessions (thinks user is idle based on stale DB timestamp). This is harmless — merge is INSERT OR IGNORE, no data loss.
+42. **CRITICAL: notify_user must run AFTER gateway is started** — `hermes chat -q` requires gateway's active WebSocket connection to deliver messages (especially to WeChat/iLink). If `notify_user()` is called before `systemctl --user start hermes-gateway.service`, the message appears sent (`hermes chat -q` returns 0) but is never delivered. Fix (2026-04-19): in both promote branches of `ha_watchdog.sh`, moved `notify_user()` to after gateway start + 5s wait + 3s extra delay (total ~8s). This ensures WebSocket is established before notification.
+43. **CRITICAL: ha_watchdog.sh must export DBUS_SESSION_BUS_ADDRESS for cron** — Despite pitfall #23 documenting this concept, the actual export lines were never added to `ha_watchdog.sh`. Cron jobs don't inherit `DBUS_SESSION_BUS_ADDRESS` or `XDG_RUNTIME_DIR` from the user session, causing ALL `systemctl --user start/stop/is-active` calls to silently fail with "Failed to connect to user scope bus". Gateway was never actually started or stopped by the watchdog — it only worked because systemd's `Restart=on-failure` happened to be enabled. Fix (2026-04-19): added `export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"` and `export XDG_RUNTIME_DIR="/run/user/$(id -u)"` at the top of `ha_watchdog.sh` after `set -euo pipefail`.
+
+## state.db Full Rebuild from Session JSON
+
+When state.db is completely empty/corrupted beyond repair, it can be rebuilt from the session JSON files that Hermes stores on disk (`~/.hermes/sessions/session_*.json`). These JSON files are the **source of truth** — they survive any DB corruption.
+
+### Session JSON structure
+
+```json
+{
+  "session_id": "20260419_081052_4c4a93",
+  "model": "glm-5-turbo",
+  "base_url": "...",
+  "platform": "cli",
+  "session_start": "2026-04-19T08:10:52.xxx",
+  "last_updated": "2026-04-19T08:50:00.xxx",
+  "system_prompt": "...",
+  "tools": [...],
+  "message_count": 58,
+  "messages": [
+    {"role": "user", "content": "..."},
+    {"role": "assistant", "content": "...", "tool_calls": [...], "reasoning": "...", "finish_reason": "tool_calls"},
+    {"role": "tool", "content": "...", "tool_call_id": "call_xxx"}
+  ]
+}
+```
+
+**Gotchas:**
+- `platform` can be the string `"None"` (not null) — DB requires non-null source field, default to `'cli'`
+- Messages don't have individual timestamps — use `session_start + index * 0.001` for ordering
+- `tool_calls` is a list of objects with `{id, type, function: {name, arguments}}`
+- `tool_name` is sometimes missing from tool role messages — extract from `tool_calls[0].function.name`
+
+### state.db schema (version 6)
+
+**sessions** table PK: `id` (TEXT)
+**messages** table PK: `id` (INTEGER, autoincrement)
+**FTS5**: `messages_fts(content, content=messages, content_rowid=id)` — external content, NOT synced via HA merge
+
+### Rebuild procedure (executed 2026-04-19)
+
+```python
+import sqlite3, json, glob, os
+from datetime import datetime
+
+db_path = os.path.expanduser("~/.hermes/state.db")
+sessions_dir = os.path.expanduser("~/.hermes/sessions")
+
+# 1. Backup current (even if empty)
+os.copy2(db_path, db_path + ".pre_rebuild.bak")
+
+# 2. Hermes auto-creates schema on startup — or delete to let it recreate
+#    If deleting: stop gateway first, delete db+wal+shm, start gateway, stop gateway, then proceed
+
+# 3. Read all session JSONs and insert
+conn = sqlite3.connect(db_path)
+c = conn.cursor()
+
+for fpath in sorted(glob.glob(f"{sessions_dir}/session_*.json")):
+    data = json.load(open(fpath))
+    sid = data['session_id']
+    
+    # Parse timestamps
+    def to_unix(ts):
+        if not ts: return 0.0
+        ts = ts.replace('Z','').split('+')[0]
+        fmt = "%Y-%m-%dT%H:%M:%S.%f" if '.' in ts else "%Y-%m-%dT%H:%M:%S"
+        return datetime.strptime(ts, fmt).timestamp()
+    
+    started = to_unix(data.get('session_start',''))
+    ended = to_unix(data.get('last_updated',''))
+    platform = data.get('platform','cli') or 'cli'  # handle "None" string
+    msgs = data.get('messages', [])
+    
+    # Insert session
+    c.execute("INSERT OR REPLACE INTO sessions (id,source,model,started_at,ended_at,message_count,tool_call_count) VALUES (?,?,?,?,?,?,?)",
+              (sid, platform, data.get('model',''), started, ended if ended>started else 0, len(msgs), 0))
+    
+    # Insert messages
+    for i, m in enumerate(msgs):
+        if not isinstance(m, dict): continue
+        tc = m.get('tool_calls','')
+        tc_str = json.dumps(tc, ensure_ascii=False) if tc and not isinstance(tc, str) else (tc or '')
+        tn = m.get('tool_name','')
+        if tc and isinstance(tc, list) and not tn and tc[0].get('function',{}).get('name'):
+            tn = tc[0]['function']['name']
+        
+        c.execute("INSERT INTO messages (session_id,role,content,tool_call_id,tool_calls,tool_name,timestamp,reasoning,finish_reason) VALUES (?,?,?,?,?,?,?,?,?)",
+                  (sid, m.get('role',''), m.get('content',''), m.get('tool_call_id',''),
+                   tc_str, tn, started + i*0.001, m.get('reasoning',''), m.get('finish_reason','')))
+
+conn.commit()
+
+# 4. Rebuild FTS5 index
+c.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+conn.commit()
+conn.close()
+
+# 5. Verify
+# python3 -c "import sqlite3; c=sqlite3.connect(os.path.expanduser('~/.hermes/state.db')).cursor(); c.execute('PRAGMA integrity_check'); print(c.fetchone()[0])"
+```
+
+### Post-rebuild checklist
+
+1. **Verify JSON<->DB coverage**: Compare session IDs in JSON files vs DB. Some sessions may exist only in DB (old JSON cleaned up) or only in JSON (new files). Both are expected; what matters is no data loss.
+2. **Update watermark file** (`~/.hermes/.ha_watermark.json`): Set `state.db.messages` to current `MAX(id)`, `state.db.sessions` to current `MAX(id)`.
+3. **Push to Pi**: `python3 ha_sync.py push` — sessions will full-exchange, messages will delta-sync.
+4. **Verify Pi**: SSH to Pi, check `PRAGMA integrity_check` and row counts match.
+5. **Note**: Current session (where Hermes is running) may show message_count mismatch — DB snapshot is from rebuild time, gateway continues adding messages. This is normal.
+
+### Watermark file format
+
+```json
+{
+  "state.db": {
+    "sessions": {"peer_max": "<max_session_id>", "local_max": "<max_session_id>"},
+    "messages": {"peer_max": <max_msg_id>, "local_max": <max_msg_id>}
+  },
+  "memory_store.db": {
+    "facts": {"peer_max": <id>, "local_max": <id>},
+    "entities": {"peer_max": <id>, "local_max": <id>}
+  }
+}
+```
+
+File location: `~/.hermes/.ha_watermark.json`. This is a **plain JSON file**, NOT a database table. Used by `ha_sync.py` for incremental merge — tracks the max PK seen on each side to only transfer delta rows.
 
 ## HA Testing Procedure
 
@@ -438,7 +596,7 @@ Systematic 6-step validation after any significant change to ha_sync.py, ha_watc
 
 ```
 Step 1 — 基础检查: init-node + status + events (both sides)
-Step 2 — 数据同步: push (验证 SYNC_EXCLUDE 保护)
+Step 2 — 数据同步: push (验证 ha_sync.py 排除保护)
          方法: 在 Pi 上给 ha_sync.py 打 marker → push → 检查 marker 保留
 Step 3 — 心跳感知: heartbeat 写入 → Pi watchdog 手动运行 → 验证 WSL online 识别
 Step 4 — Handoff: WSL→Pi 切换 → 验证 Pi primary + gateway active + epoch 递增

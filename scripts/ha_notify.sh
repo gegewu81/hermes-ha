@@ -70,7 +70,7 @@ esac
 
 # --- Send notification ---
 echo "Sending: ${MESSAGE}"
-hermes chat -q "${MESSAGE}" 2>&1
+hermes chat -q "${MESSAGE}" -Q 2>&1
 RC=$?
 
 if [ $RC -eq 0 ]; then

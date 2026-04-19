@@ -27,6 +27,12 @@
 
 set -euo pipefail
 
+# --- Cron env fix (pitfall #23) ---
+# Cron doesn't inherit DBUS/XDG from user session. Without these,
+# systemctl --user silently fails (can't connect to user scope bus).
+export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+
 # --- Config ---
 export PATH="$HOME/.hermes/node/bin:$HOME/.local/bin:$PATH"
 HERMES_HOME="$HOME/.hermes"
@@ -231,12 +237,11 @@ with open('$STATE_FILE', 'w') as f:
 " 2>/dev/null
 
         log_event "failover" "$PEER_LABEL offline for ${HEARTBEAT_AGE}s, $NODE_LABEL promoted to PRIMARY (epoch $NEW_EPOCH)"
-        notify_user "⚠️ HA FAILOVER: $PEER_LABEL offline (${HEARTBEAT_AGE}s), $NODE_LABEL is now PRIMARY (epoch $NEW_EPOCH)"
 
-        # Start gateway
+        # Start gateway FIRST — notify needs gateway's WebSocket to deliver
         if [ "$GW_RUNNING" = "NO" ]; then
             systemctl --user start hermes-gateway.service
-            sleep 2
+            sleep 5
             if systemctl --user is-active hermes-gateway.service >/dev/null 2>&1; then
                 log "$NODE_LABEL promoted to PRIMARY (epoch $NEW_EPOCH). Gateway started."
             else
@@ -246,6 +251,10 @@ with open('$STATE_FILE', 'w') as f:
         else
             log "$NODE_LABEL promoted to PRIMARY (epoch $NEW_EPOCH). Gateway already running."
         fi
+
+        # Notify AFTER gateway is up — hermes chat -q requires active WebSocket
+        sleep 3
+        notify_user "⚠️ HA FAILOVER: $PEER_LABEL offline (${HEARTBEAT_AGE}s), $NODE_LABEL is now PRIMARY (epoch $NEW_EPOCH)"
 
     elif [ "$ROLE" = "standby" ] && [ "$LAST_PRIMARY" = "$NODE_NAME" ]; then
         # Edge case: we are standby but last_primary was us (e.g. after a handoff that
@@ -269,12 +278,22 @@ with open('$STATE_FILE', 'w') as f:
 " 2>/dev/null
 
         log_event "failover" "$PEER_LABEL offline for ${HEARTBEAT_AGE}s, $NODE_LABEL promoted to PRIMARY (epoch $NEW_EPOCH, last_primary was self)"
-        notify_user "⚠️ HA FAILOVER: $NODE_LABEL promoted to PRIMARY (epoch $NEW_EPOCH)"
 
         if [ "$GW_RUNNING" = "NO" ]; then
             systemctl --user start hermes-gateway.service
-            log "Gateway started after promote"
+            sleep 5
+            if systemctl --user is-active hermes-gateway.service >/dev/null 2>&1; then
+                log "$NODE_LABEL promoted to PRIMARY (epoch $NEW_EPOCH). Gateway started after promote."
+            else
+                log "WARNING: Gateway FAILED to start after promote (epoch $NEW_EPOCH)"
+                log_event "error" "Gateway start FAILED after promote (epoch $NEW_EPOCH)"
+            fi
+        else
+            log "$NODE_LABEL promoted to PRIMARY (epoch $NEW_EPOCH). Gateway already running."
         fi
+
+        sleep 3
+        notify_user "⚠️ HA FAILOVER: $NODE_LABEL promoted to PRIMARY (epoch $NEW_EPOCH)"
 
     else
         # Unknown state — log for debugging
