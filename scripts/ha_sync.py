@@ -34,8 +34,8 @@ from pathlib import Path
 
 HERMES_DIR = Path(os.environ.get("HERMES_DIR", "~/.hermes")).expanduser()
 SCRIPT_DIR = Path(__file__).resolve().parent
-PI_HOST = "pi"
-HERMES_USER = "chao"  # local username (same on Pi)
+PI_HOST = os.environ.get("HA_PI_HOST", "pi")
+HERMES_USER = os.environ.get("HA_PI_USER", os.environ.get("USER", ""))
 
 # Key paths
 SESSIONS_DIR = HERMES_DIR / "sessions"
