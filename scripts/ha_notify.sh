@@ -1,82 +1,73 @@
 #!/bin/bash
-# Hermes HA Notify — send notifications via hermes chat
+# ha_notify.sh — User notification helper for HA events
+# Sends notifications via available channels (terminal bell, notify-send, log)
 #
 # Usage:
-#   ./ha_notify.sh "message"              # Send message to user
-#   ./ha_notify.sh --event takeover      # Send preset event message
-#   ./ha_notify.sh --test                 # Test notification
-#
-# This script is a standalone utility. ha_sync.py v2 and ha_watchdog.sh v2
-# call hermes chat directly, but this script provides a convenient wrapper
-# for manual use and debugging.
+#   ha_notify.sh "Primary failover detected"
+#   ha_notify.sh --level warn "Pi unreachable"
 
-export PATH="$HOME/.hermes/node/bin:$HOME/.local/bin:$PATH"
-NODE_FILE="$HOME/.hermes/.ha_node"
-STATE_FILE="$HOME/.hermes/.ha_state"
+set -euo pipefail
 
-# --- Get node name ---
-NODE_NAME="unknown"
-NODE_TYPE="unknown"
-if [ -f "$NODE_FILE" ]; then
-    NODE_NAME=$(python3 -c "import json; d=json.load(open('$NODE_FILE')); print(d.get('name','unknown'))" 2>/dev/null || echo "unknown")
-    NODE_TYPE=$(python3 -c "import json; d=json.load(open('$NODE_FILE')); print(d.get('type','unknown'))" 2>/dev/null || echo "unknown")
-fi
-
-# --- Preset event messages ---
-case "${1:-}" in
-    --test)
-        MESSAGE="🔔 HA Test: Notification from ${NODE_NAME} (${NODE_TYPE}). If you see this, notifications work!"
-        ;;
-    --event)
-        EVENT="${2:-unknown}"
-        ROLE=$(python3 -c "import json; d=json.load(open('$STATE_FILE')); print(d.get('role','?'))" 2>/dev/null || echo "?")
-        EPOCH=$(python3 -c "import json; d=json.load(open('$STATE_FILE')); print(d.get('epoch','?'))" 2>/dev/null || echo "?")
-        case "$EVENT" in
-            takeover)
-                MESSAGE="🔔 HA Takeover: ${NODE_NAME} → PRIMARY (epoch ${EPOCH}). Peer is STANDBY."
-                ;;
-            handoff)
-                MESSAGE="🔔 HA Handoff: ${NODE_NAME} → OFFLINE. Peer → PRIMARY (epoch ${EPOCH})."
-                ;;
-            failover)
-                MESSAGE="🔔 HA Failover: Peer offline. ${NODE_NAME} → PRIMARY (epoch ${EPOCH})."
-                ;;
-            recovery)
-                MESSAGE="🔔 HA Recovery: Peer back online. ${NODE_NAME} → STANDBY."
-                ;;
-            *)
-                MESSAGE="🔔 HA Event [${EVENT}]: ${NODE_NAME} (role=${ROLE}, epoch=${EPOCH})."
-                ;;
-        esac
-        ;;
-    --help|-h)
-        echo "Usage: $0 [message|--event TYPE|--test|--help]"
-        echo ""
-        echo "Options:"
-        echo "  message        Send custom message"
-        echo "  --event TYPE   Send preset event (takeover|handoff|failover|recovery)"
-        echo "  --test         Send test notification"
-        echo "  --help         Show this help"
-        exit 0
-        ;;
-    "")
-        echo "Usage: $0 [message|--event TYPE|--test|--help]"
-        exit 1
-        ;;
-    *)
-        MESSAGE="$1"
-        ;;
-esac
-
-# --- Send notification ---
-echo "Sending: ${MESSAGE}"
-hermes chat -q "${MESSAGE}" -Q 2>&1
-RC=$?
-
-if [ $RC -eq 0 ]; then
-    echo "OK: Notification sent successfully."
-else
-    echo "ERROR: Notification failed (exit code ${RC})."
-    echo "Make sure 'hermes chat -q' works on this node."
+LEVEL="${1:-info}"
+shift || true
+MESSAGE="${*:-}"
+if [ -z "${MESSAGE}" ]; then
+    echo "Usage: ha_notify.sh [--level LEVEL] MESSAGE"
     exit 1
 fi
+
+# Parse --level flag
+if [ "${LEVEL}" = "--level" ]; then
+    LEVEL="${1:-info}"
+    shift || true
+    MESSAGE="${*:-}"
+fi
+
+HERMES_DIR="${HOME}/.hermes"
+LOG_FILE="${HERMES_DIR}/logs/ha_notify.log"
+HA_EVENTS="${HERMES_DIR}/.ha/events.log"
+
+ensure_log() {
+    mkdir -p "${HERMES_DIR}/logs" "${HERMES_DIR}/.ha"
+}
+
+log_to_file() {
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    local line="[${ts}] [${LEVEL^^}] ${MESSAGE}"
+    echo "${line}" >> "${LOG_FILE}" 2>/dev/null || true
+    echo "${line}" >> "${HA_EVENTS}" 2>/dev/null || true
+}
+
+bell() {
+    printf '\a' 2>/dev/null || true
+}
+
+desktop_notify() {
+    if command -v notify-send &>/dev/null && [ -n "${DISPLAY:-}" ]; then
+        local icon="dialog-information"
+        case "${LEVEL}" in
+            error|crit) icon="dialog-error" ;;
+            warn|warning) icon="dialog-warning" ;;
+        esac
+        notify-send -u "${LEVEL}" -i "${icon}" "Hermes HA" "${MESSAGE}" 2>/dev/null || true
+    fi
+}
+
+main() {
+    ensure_log
+    log_to_file
+
+    # Always bell for error/warn
+    case "${LEVEL}" in
+        error|warn|warning|crit)
+            bell
+            desktop_notify
+            ;;
+    esac
+
+    # Print to stderr for cron visibility
+    echo "[${LEVEL^^}] ${MESSAGE}" >&2
+}
+
+main "$@"
